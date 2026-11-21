@@ -1,0 +1,21 @@
+{
+  "name": "ocean-himalayas-3d",
+  "version": "0.1.0",
+  "private": true,
+  "description": "《旷野之息》风3D开放世界物理沙盒：海中喜马拉雅（Three.js + Rapier3D + VRM）",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0 --port 5173",
+    "build": "vite build",
+    "build:singlefile": "node scripts/build-singlefile.mjs",
+    "preview": "vite preview --host 0.0.0.0 --port 4173"
+  },
+  "dependencies": {
+    "@dimforge/rapier3d-compat": "^0.14.0",
+    "@pixiv/three-vrm": "^3.2.0",
+    "three": "^0.170.0"
+  },
+  "devDependencies": {
+    "vite": "^6.0.0"
+  }
+}
