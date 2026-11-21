@@ -274,6 +274,22 @@ export class PlayerController {
     this.domElement.addEventListener('contextmenu', this._onContextMenu);
   }
 
+  /** Smooth external camera rotation (used by mobile touch-look) */
+  applyLookDelta(dx, dy) {
+    const sens = this.dragSensitivity * 1.15;
+    this.yaw -= clamp(dx, -140, 140) * sens;
+    this.pitch = clamp(this.pitch + clamp(dy, -140, 140) * sens, this.minPitch, this.maxPitch);
+  }
+
+  /** Smooth external camera zoom (used by mobile two-finger pinch) */
+  applyZoomDelta(delta) {
+    this.cameraDistance = clamp(
+      this.cameraDistance + delta,
+      this.minCameraDistance,
+      this.maxCameraDistance
+    );
+  }
+
   /**
    * Computes camera yaw/pitch and heroine facing from origin toward a target point.
    */
@@ -527,16 +543,22 @@ export class PlayerController {
       vel.set(0, 0, 0);
     }
 
-    // Read movement & action inputs
-    const fwdIn =
+    // Read movement & action inputs (keyboard + mobile analog joystick)
+    const keyFwd =
       (isKeyPressed(keys, ['KeyW', 'w', 'ArrowUp']) ? 1 : 0) -
       (isKeyPressed(keys, ['KeyS', 's', 'ArrowDown']) ? 1 : 0);
-    const rightIn =
+    const keyRight =
       (isKeyPressed(keys, ['KeyD', 'd', 'ArrowRight']) ? 1 : 0) -
       (isKeyPressed(keys, ['KeyA', 'a', 'ArrowLeft']) ? 1 : 0);
-    const sprintDown = isKeyPressed(keys, ['ShiftLeft', 'ShiftRight', 'shift']);
-    const spaceDown = isKeyPressed(keys, ['Space', ' ']);
-    const climbKeyDown = isKeyPressed(keys, ['KeyC', 'c']);
+    const analogFwd = typeof keys?._analogFwd === 'number' ? keys._analogFwd : 0;
+    const analogRight = typeof keys?._analogRight === 'number' ? keys._analogRight : 0;
+
+    const fwdIn = clamp(keyFwd + analogFwd, -1, 1);
+    const rightIn = clamp(keyRight + analogRight, -1, 1);
+    const sprintDown =
+      isKeyPressed(keys, ['ShiftLeft', 'ShiftRight', 'shift']) || Boolean(keys?._touchSprint);
+    const spaceDown = isKeyPressed(keys, ['Space', ' ']) || Boolean(keys?._touchSpace);
+    const climbKeyDown = isKeyPressed(keys, ['KeyC', 'c']) || Boolean(keys?._touchClimb);
 
     const spaceJustPressed = spaceDown && !this._prevSpaceDown;
     const climbJustPressed = climbKeyDown && !this._prevClimbKeyDown;
@@ -557,7 +579,8 @@ export class PlayerController {
       .set(0, 0, 0)
       .addScaledVector(this._camForwardXZ, fwdIn)
       .addScaledVector(this._camRightXZ, rightIn);
-    const hasMoveInput = this._moveDir.lengthSq() > 1e-4;
+    const moveMag = Math.min(1, this._moveDir.length());
+    const hasMoveInput = moveMag > 0.08;
     if (hasMoveInput) {
       this._moveDir.normalize();
     }

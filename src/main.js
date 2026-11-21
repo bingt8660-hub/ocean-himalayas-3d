@@ -16,6 +16,7 @@ import { HeroineCharacter } from './character/HeroineCharacter.js';
 import { PlayerController } from './character/PlayerController.js';
 import { SoundEngine } from './audio/SoundEngine.js';
 import { HUD } from './ui/HUD.js';
+import { TouchControls, isTouchDevice } from './ui/TouchControls.js';
 
 const PROP_BY_KEY = new Map();
 for (const prop of Object.values(PROP_CATALOG)) {
@@ -34,8 +35,10 @@ async function boot() {
   let heroine = null;
   let player = null;
   let ultrahand = null;
+  let touchControls = null;
   let renderer = null;
   let modelLoadToken = 0;
+  const isMobile = isTouchDevice();
 
   // Reusable scratch vectors (zero per-frame allocations)
   const handPos = new THREE.Vector3();
@@ -121,10 +124,12 @@ async function boot() {
       sound.unlock();
       sound.play('biome');
       document.activeElement?.blur?.();
-      try {
-        renderer?.domElement?.requestPointerLock?.();
-      } catch {
-        // Pointer lock is optional if browser blocks it
+      if (!isMobile && !touchControls?.enabled) {
+        try {
+          renderer?.domElement?.requestPointerLock?.();
+        } catch {
+          // Pointer lock is optional if browser blocks it
+        }
       }
       hud.showBiomeBanner('珊瑚海湾沙滩', 'CORAL BAY SHORELINE');
     },
@@ -155,6 +160,14 @@ async function boot() {
       document.activeElement?.blur?.();
       loadCharacterModel(model);
     },
+    onToggleTouch: () => {
+      sound.unlock();
+      document.activeElement?.blur?.();
+      if (!touchControls) return false;
+      const active = touchControls.toggle();
+      hud.showToast(active ? '已开启手机虚拟按键' : '已关闭虚拟按键', 'info', 1500);
+      return active;
+    },
     onToggleMute: () => {
       sound.unlock();
       document.activeElement?.blur?.();
@@ -181,11 +194,12 @@ async function boot() {
     hud.setLoadingProgress(12, '正在创建 WebGL 渲染引擎...');
 
     // --- Three.js Renderer, Scene & Camera ---
+    const maxDpr = isMobile ? 1.5 : 2;
     renderer = new THREE.WebGLRenderer({
-      antialias: true,
+      antialias: !isMobile,
       powerPreference: 'high-performance',
     });
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, maxDpr));
     renderer.setSize(window.innerWidth, window.innerHeight);
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 1.06;
@@ -205,7 +219,7 @@ async function boot() {
     window.addEventListener('resize', () => {
       camera.aspect = window.innerWidth / window.innerHeight;
       camera.updateProjectionMatrix();
-      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, maxDpr));
       renderer.setSize(window.innerWidth, window.innerHeight);
     });
 
@@ -230,8 +244,58 @@ async function boot() {
 
     ultrahand = new UltrahandSystem(physics, scene, camera);
 
-    // --- 4. Input Bindings ---
+    // --- 4. Input Bindings (Keyboard + Mobile Virtual Touch Controls) ---
     const keys = Object.create(null);
+
+    touchControls = new TouchControls(container, renderer.domElement, keys, {
+      onInteract: () => sound.unlock(),
+      onAutoEnable: () => hud.setTouchActive(true),
+      onLookDelta: (dx, dy) => player.applyLookDelta(dx, dy),
+      onPinchZoom: (delta) => {
+        if (ultrahand.heldProp) {
+          ultrahand.adjustDistance(-delta * 0.8);
+        } else {
+          player.applyZoomDelta(delta);
+        }
+      },
+      onGrabOrRelease: () => {
+        const wasHeld = Boolean(ultrahand.heldProp);
+        player.getRightHandWorldPos(handPos);
+        ultrahand.tryGrabOrRelease(handPos);
+        const nowHeld = Boolean(ultrahand.heldProp);
+        if (!wasHeld && nowHeld) sound.play('grab');
+        else if (wasHeld && !nowHeld) sound.play('release');
+      },
+      onWeld: () => {
+        const beforeJoints = physics.getPropCount()?.joints ?? 0;
+        const welded = ultrahand.tryWeld();
+        const afterJoints = physics.getPropCount()?.joints ?? 0;
+        if (welded || afterJoints > beforeJoints) {
+          sound.play('weld');
+          hud.showToast('究极手粘合成功', 'success', 1600);
+        }
+      },
+      onUnweld: () => {
+        const beforeJoints = physics.getPropCount()?.joints ?? 0;
+        const unwelded = ultrahand.tryUnweld();
+        const afterJoints = physics.getPropCount()?.joints ?? 0;
+        if (unwelded || afterJoints < beforeJoints) {
+          sound.play('unweld');
+          hud.showToast('已拆开粘合连接', 'info', 1500);
+        }
+      },
+      onRotate: (axis, dir) => ultrahand.rotateHeld(axis, dir),
+      onThrow: () => {
+        if (ultrahand.heldProp) {
+          ultrahand.throwHeld();
+          sound.play('throw');
+        }
+      },
+      onAdjustDistance: (delta) => ultrahand.adjustDistance(delta),
+      onToggleActivate: () => toggleNearbyContraptions(),
+      onSpawnProp: (propId) => spawnProp(propId),
+    });
+    hud.setTouchActive(touchControls.enabled);
 
     const setKeyState = (e, pressed) => {
       keys[e.code] = pressed;
@@ -437,6 +501,7 @@ async function boot() {
             joints: counts.joints,
           }
         );
+        touchControls?.update(playerState, ultrahandState);
       }
 
       renderer.render(scene, camera);

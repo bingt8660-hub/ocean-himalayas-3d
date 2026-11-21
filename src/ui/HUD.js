@@ -260,6 +260,10 @@ export class HUD {
             Seed-san ⇄
           </button>
 
+          <button class="oh-icon-btn" type="button" data-ref="touchBtn" title="开启 / 关闭手机虚拟按键">
+            🎮
+          </button>
+
           <button class="oh-icon-btn" type="button" data-ref="muteBtn" title="[M] 静音 / 开启环境音与音效">
             🔊
           </button>
@@ -434,6 +438,15 @@ export class HUD {
       this.callbacks.onSwitchCharacter?.(nextModel);
     });
 
+    // Virtual touch controls toggle
+    this.el.touchBtn?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const nextTouch = this.callbacks.onToggleTouch?.();
+      if (typeof nextTouch === 'boolean') {
+        this.setTouchActive(nextTouch);
+      }
+    });
+
     // Mute button
     this.el.muteBtn.addEventListener('click', (e) => {
       e.stopPropagation();
@@ -522,6 +535,10 @@ export class HUD {
     if (idx >= 0) this._activeCharIndex = idx;
     const shortLabel = modelId === 'heroine' ? 'VRoid ⇄' : 'Seed-san ⇄';
     this.el.charBtn.textContent = shortLabel;
+  }
+
+  setTouchActive(active) {
+    this.el.touchBtn?.classList.toggle('is-active', Boolean(active));
   }
 
   setMuted(muted) {
