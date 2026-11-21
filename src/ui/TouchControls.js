@@ -1,10 +1,12 @@
 /**
  * Ergonomic Dual-Thumb Mobile Virtual Controls for "海中喜马拉雅" (Ocean Himalayas 3D).
- * - Left analog joystick (360° smooth movement + auto-sprint outer ring)
- * - Open-viewport multi-touch camera look + two-finger pinch zoom
+ * - Genshin-style Dynamic Floating Left Analog Joystick (42% × 48% lower-left touch zone)
+ * - Outer-ring Auto-Sprint illumination (>92% push) + dedicated Sprint button
+ * - Micro haptic feedback (navigator.vibrate) on crisp gameplay actions
+ * - Multi-touch isolated open-viewport camera look + two-finger pinch zoom
  * - Right Genshin/BotW action arc: Jump/Paraglider, Sprint, Climb, Ultrahand Grab, Activate
- * - Contextual Ultrahand sub-bar (Weld, Rotate, Throw, Unweld, Near/Far) shown while holding props
- * - Collapsible 7-part Quick-Spawn drawer so mobile screens stay clean and unobstructed
+ * - Contextual Ultrahand sub-bar (Weld, Level, Rotate, Throw, Unweld, Near/Far)
+ * - Collapsible Quick-Spawn drawer with 3 One-Tap Vehicle Presets + 7 Physics Parts
  */
 
 import { PROP_CATALOG } from '../config/worldConfig.js';
@@ -18,6 +20,14 @@ export function isTouchDevice() {
   );
 }
 
+function vibrate(ms = 12) {
+  try {
+    navigator?.vibrate?.(ms);
+  } catch {
+    // Ignore on browsers without Vibration API (e.g. iOS Safari)
+  }
+}
+
 const PROP_SHORT_ICONS = {
   plank: '🪵',
   log: '🌲',
@@ -27,6 +37,16 @@ const PROP_SHORT_ICONS = {
   boulder: '🪨',
   barrel: '🧨',
 };
+
+const VEHICLE_PRESETS = [
+  { id: 'raft', icon: '🛶', label: '涡轮木筏' },
+  { id: 'buggy', icon: '🏎️', label: '越野车' },
+  { id: 'rocket_sled', icon: '🚀', label: '火箭板' },
+];
+
+function clamp(v, min, max) {
+  return Math.max(min, Math.min(max, v));
+}
 
 export class TouchControls {
   /**
@@ -44,11 +64,13 @@ export class TouchControls {
     this.enabled = isTouchDevice();
     this._spawnOpen = false;
 
-    // Joystick state
+    // Floating dynamic joystick state
     this._joyPointerId = null;
     this._joyCenterX = 0;
     this._joyCenterY = 0;
-    this._joyMaxR = 46;
+    this._joyMaxR = 48;
+    this._joyAutoSprint = false;
+    this._btnSprintHeld = false;
 
     // Multi-touch canvas camera look & pinch state
     this._canvasTouches = new Map(); // touchId -> { x, y }
@@ -61,6 +83,7 @@ export class TouchControls {
     this._buildDOM();
     this._bindJoystick();
     this._bindActionButtons();
+    this._bindOutsideDismiss();
     this._bindCanvasTouchLook();
     this.setEnabled(this.enabled);
   }
@@ -68,6 +91,15 @@ export class TouchControls {
   _buildDOM() {
     this.root = document.createElement('div');
     this.root.className = 'oh-touch-root';
+
+    const presetButtons = VEHICLE_PRESETS.map(
+      (preset) => `
+        <button class="oh-t-preset-item" data-preset="${preset.id}" type="button">
+          <span class="oh-t-preset-ico">${preset.icon}</span>
+          <span class="oh-t-preset-lbl">${preset.label}</span>
+        </button>
+      `
+    ).join('');
 
     const propButtons = Object.values(PROP_CATALOG)
       .map(
@@ -81,27 +113,37 @@ export class TouchControls {
       .join('');
 
     this.root.innerHTML = `
-      <!-- Left Analog Joystick -->
+      <!-- Left Floating Dynamic Analog Joystick Quadrant -->
       <div class="oh-t-joy-zone" data-ref="joyZone">
+        <div class="oh-t-joy-anchor" data-ref="joyAnchor" aria-hidden="true"></div>
         <div class="oh-t-joy-base" data-ref="joyBase">
           <div class="oh-t-joy-ring"></div>
+          <div class="oh-t-joy-sprint-ring"></div>
           <div class="oh-t-joy-knob" data-ref="joyKnob"></div>
         </div>
       </div>
 
-      <!-- Collapsible Quick-Spawn Drawer (Left-Top above joystick) -->
+      <!-- Collapsible Quick-Spawn Drawer (Vehicle Presets + 7 Physics Parts) -->
       <div class="oh-t-spawn-wrap" data-ref="spawnWrap">
         <button class="oh-t-mini-btn oh-t-spawn-toggle" data-ref="spawnToggle" type="button">
           <span>📦 召唤</span>
         </button>
         <div class="oh-t-spawn-panel" data-ref="spawnPanel">
-          ${propButtons}
+          <div class="oh-t-spawn-section-lbl">一键整车</div>
+          <div class="oh-t-preset-row">
+            ${presetButtons}
+          </div>
+          <div class="oh-t-spawn-section-lbl">自由拼装部件</div>
+          <div class="oh-t-parts-grid">
+            ${propButtons}
+          </div>
         </div>
       </div>
 
       <!-- Contextual Ultrahand Sub-Controls (Visible only while holding a prop) -->
       <div class="oh-t-ultra-bar" data-ref="ultraBar">
         <button class="oh-t-ultra-btn is-weld" data-ref="btnWeld" type="button">✨ 粘合</button>
+        <button class="oh-t-ultra-btn" data-ref="btnLevel" type="button">📐 摆平</button>
         <button class="oh-t-ultra-btn" data-ref="btnRotateY" type="button">↻ 旋转</button>
         <button class="oh-t-ultra-btn" data-ref="btnThrow" type="button">💨 投掷</button>
         <button class="oh-t-ultra-btn" data-ref="btnUnweld" type="button">✂️ 拆开</button>
@@ -151,6 +193,9 @@ export class TouchControls {
     document.body.classList.toggle('oh-touch-mode', this.enabled);
     if (!this.enabled) {
       this._resetJoystick();
+      this.closeSpawnDrawer();
+      this._btnSprintHeld = false;
+      this._joyAutoSprint = false;
       this.keys._touchSprint = false;
       this.keys._touchSpace = false;
       this.keys._touchClimb = false;
@@ -162,12 +207,27 @@ export class TouchControls {
     return this.enabled;
   }
 
+  closeSpawnDrawer() {
+    if (!this._spawnOpen) return;
+    this._spawnOpen = false;
+    this.el.spawnWrap?.classList.remove('is-open');
+  }
+
+  _syncSprintState() {
+    this.keys._touchSprint = Boolean(this._btnSprintHeld || this._joyAutoSprint);
+    this.el.btnSprint?.classList.toggle('is-auto-sprint', this._joyAutoSprint);
+  }
+
   _resetJoystick() {
     this._joyPointerId = null;
+    this._joyAutoSprint = false;
     this.keys._analogFwd = 0;
     this.keys._analogRight = 0;
+    this._syncSprintState();
+
     this.el.joyKnob.style.transform = 'translate3d(0px, 0px, 0px)';
-    this.el.joyBase.classList.remove('is-active');
+    this.el.joyBase.classList.remove('is-active', 'is-dragging', 'is-sprint');
+    this.el.joyBase.style.transform = 'translate3d(0px, 0px, 0px)';
   }
 
   _updateJoystickFromClient(clientX, clientY) {
@@ -185,19 +245,42 @@ export class TouchControls {
     const normX = kx / maxR;
     const normY = ky / maxR;
 
-    // Deadzone 0.10
+    // Deadzone 0.09
     const mag = Math.hypot(normX, normY);
-    if (mag < 0.1) {
+    if (mag < 0.09) {
       this.keys._analogRight = 0;
       this.keys._analogFwd = 0;
     } else {
       this.keys._analogRight = normX;
       this.keys._analogFwd = -normY; // screen up (-Y) is forward (+1)
     }
+
+    // Outer-ring auto-sprint (>92% rim with smooth hysteresis)
+    const rawRatio = dist / maxR;
+    if (!this._joyAutoSprint && rawRatio > 0.92) {
+      this._joyAutoSprint = true;
+      this.el.joyBase.classList.add('is-sprint');
+      this._syncSprintState();
+      vibrate(8);
+    } else if (this._joyAutoSprint && rawRatio < 0.84) {
+      this._joyAutoSprint = false;
+      this.el.joyBase.classList.remove('is-sprint');
+      this._syncSprintState();
+    }
   }
 
   _bindJoystick() {
     const zone = this.el.joyZone;
+
+    // Prevent touch events inside joystick zone from reaching canvas
+    zone.addEventListener(
+      'touchstart',
+      (e) => {
+        if (!this.enabled) return;
+        e.stopPropagation();
+      },
+      { passive: true }
+    );
 
     zone.addEventListener(
       'pointerdown',
@@ -206,6 +289,7 @@ export class TouchControls {
         e.preventDefault();
         e.stopPropagation();
         this.cb.onInteract?.();
+        this.closeSpawnDrawer();
 
         if (this._joyPointerId !== null) return;
         this._joyPointerId = e.pointerId;
@@ -213,12 +297,30 @@ export class TouchControls {
           zone.setPointerCapture(e.pointerId);
         } catch {}
 
-        const rect = this.el.joyBase.getBoundingClientRect();
-        this._joyCenterX = rect.left + rect.width * 0.5;
-        this._joyCenterY = rect.top + rect.height * 0.5;
-        this._joyMaxR = Math.max(36, rect.width * 0.42);
+        // Position floating joystick smoothly under thumb, clamped within safe viewport bounds
+        const anchorRect = this.el.joyAnchor.getBoundingClientRect();
+        const zoneRect = zone.getBoundingClientRect();
+        const baseR = Math.max(46, anchorRect.width * 0.5);
+        const restCenterX = anchorRect.left + anchorRect.width * 0.5;
+        const restCenterY = anchorRect.top + anchorRect.height * 0.5;
 
-        this.el.joyBase.classList.add('is-active');
+        const minX = Math.max(baseR + 12, zoneRect.left + baseR + 8);
+        const maxX = Math.max(minX, zoneRect.right - baseR - 6);
+        const minY = Math.max(baseR + 12, zoneRect.top + baseR + 8);
+        const maxY = Math.max(minY, Math.min(window.innerHeight - baseR - 14, zoneRect.bottom - baseR - 8));
+
+        const targetCenterX = clamp(e.clientX, minX, maxX);
+        const targetCenterY = clamp(e.clientY, minY, maxY);
+
+        this._joyCenterX = targetCenterX;
+        this._joyCenterY = targetCenterY;
+        this._joyMaxR = Math.max(38, baseR * 0.86);
+
+        const offsetX = targetCenterX - restCenterX;
+        const offsetY = targetCenterY - restCenterY;
+
+        this.el.joyBase.classList.add('is-active', 'is-dragging');
+        this.el.joyBase.style.transform = `translate3d(${offsetX.toFixed(1)}px, ${offsetY.toFixed(1)}px, 0px)`;
         this._updateJoystickFromClient(e.clientX, e.clientY);
       },
       { passive: false }
@@ -247,6 +349,13 @@ export class TouchControls {
   _bindTap(el, onDown, onUp = null) {
     if (!el) return;
     el.addEventListener(
+      'touchstart',
+      (e) => {
+        e.stopPropagation();
+      },
+      { passive: true }
+    );
+    el.addEventListener(
       'pointerdown',
       (e) => {
         e.preventDefault();
@@ -270,10 +379,11 @@ export class TouchControls {
   }
 
   _bindActionButtons() {
-    // Jump / Paraglider toggle (pulse Space down/up cleanly)
+    // Jump / Paraglider toggle (pulse Space cleanly)
     this._bindTap(
       this.el.btnJump,
       () => {
+        vibrate(14);
         this.keys._touchSpace = true;
         if (this._spacePulseTimer) clearTimeout(this._spacePulseTimer);
       },
@@ -286,10 +396,13 @@ export class TouchControls {
     this._bindTap(
       this.el.btnSprint,
       () => {
-        this.keys._touchSprint = true;
+        vibrate(10);
+        this._btnSprintHeld = true;
+        this._syncSprintState();
       },
       () => {
-        this.keys._touchSprint = false;
+        this._btnSprintHeld = false;
+        this._syncSprintState();
       }
     );
 
@@ -297,6 +410,7 @@ export class TouchControls {
     this._bindTap(
       this.el.btnClimb,
       () => {
+        vibrate(12);
         this.keys._touchClimb = true;
         if (this._climbPulseTimer) clearTimeout(this._climbPulseTimer);
         this._climbPulseTimer = setTimeout(() => {
@@ -310,34 +424,101 @@ export class TouchControls {
 
     // Ultrahand Grab / Release
     this._bindTap(this.el.btnGrab, () => {
+      vibrate(14);
       this.cb.onGrabOrRelease?.();
     });
 
     // Activate nearby contraption (raft fan, buggy, rocket, barrel)
     this._bindTap(this.el.btnActivate, () => {
+      vibrate(15);
       this.cb.onToggleActivate?.();
     });
 
     // Contextual Ultrahand sub-buttons
-    this._bindTap(this.el.btnWeld, () => this.cb.onWeld?.());
-    this._bindTap(this.el.btnRotateY, () => this.cb.onRotate?.('y', 1));
-    this._bindTap(this.el.btnThrow, () => this.cb.onThrow?.());
-    this._bindTap(this.el.btnUnweld, () => this.cb.onUnweld?.());
-    this._bindTap(this.el.btnCloser, () => this.cb.onAdjustDistance?.(-1.2));
-    this._bindTap(this.el.btnFarther, () => this.cb.onAdjustDistance?.(1.2));
+    this._bindTap(this.el.btnWeld, () => {
+      if (this.el.btnWeld.disabled) return;
+      vibrate(18);
+      this.cb.onWeld?.();
+    });
+    this._bindTap(this.el.btnLevel, () => {
+      vibrate(12);
+      this.cb.onLevelHeld?.();
+    });
+    this._bindTap(this.el.btnRotateY, () => {
+      vibrate(10);
+      this.cb.onRotate?.('y', 1);
+    });
+    this._bindTap(this.el.btnThrow, () => {
+      vibrate(16);
+      this.cb.onThrow?.();
+    });
+    this._bindTap(this.el.btnUnweld, () => {
+      vibrate(12);
+      this.cb.onUnweld?.();
+    });
+    this._bindTap(this.el.btnCloser, () => {
+      vibrate(10);
+      this.cb.onAdjustDistance?.(-1.2);
+    });
+    this._bindTap(this.el.btnFarther, () => {
+      vibrate(10);
+      this.cb.onAdjustDistance?.(1.2);
+    });
 
     // Collapsible Spawn Drawer
     this._bindTap(this.el.spawnToggle, () => {
+      vibrate(10);
       this._spawnOpen = !this._spawnOpen;
       this.el.spawnWrap.classList.toggle('is-open', this._spawnOpen);
     });
 
+    // Prevent touching inside spawn panel from leaking to canvas
+    this.el.spawnPanel?.addEventListener(
+      'pointerdown',
+      (e) => {
+        e.stopPropagation();
+      },
+      { passive: true }
+    );
+    this.el.spawnPanel?.addEventListener(
+      'touchstart',
+      (e) => {
+        e.stopPropagation();
+      },
+      { passive: true }
+    );
+
+    // One-tap Complete Vehicle Presets
+    this.root.querySelectorAll('.oh-t-preset-item').forEach((btn) => {
+      this._bindTap(btn, () => {
+        vibrate(16);
+        const presetId = btn.getAttribute('data-preset');
+        this.cb.onSpawnPreset?.(presetId);
+        this.closeSpawnDrawer();
+      });
+    });
+
+    // 7 Individual Physics Parts
     this.root.querySelectorAll('.oh-t-spawn-item').forEach((btn) => {
       this._bindTap(btn, () => {
+        vibrate(13);
         const propId = btn.getAttribute('data-spawn');
         this.cb.onSpawnProp?.(propId);
       });
     });
+  }
+
+  _bindOutsideDismiss() {
+    window.addEventListener(
+      'pointerdown',
+      (e) => {
+        if (!this._spawnOpen) return;
+        if (this.el.spawnWrap && !this.el.spawnWrap.contains(e.target)) {
+          this.closeSpawnDrawer();
+        }
+      },
+      { passive: true }
+    );
   }
 
   _bindCanvasTouchLook() {
@@ -347,18 +528,28 @@ export class TouchControls {
     canvas.addEventListener(
       'touchstart',
       (e) => {
+        if (e.target !== canvas) return;
+
         // Auto-reveal touch controls if user touches screen on a touch device
         if (!this.enabled) {
           this.setEnabled(true);
           this.cb.onAutoEnable?.();
         }
-        e.preventDefault();
+
+        // Auto-close spawn drawer & any open mobile HUD sheets when touching the 3D scene
+        this.closeSpawnDrawer();
+        this.cb.onCanvasTap?.();
         this.cb.onInteract?.();
 
+        let addedAny = false;
         for (let i = 0; i < e.changedTouches.length; i++) {
           const t = e.changedTouches[i];
+          if (t.target !== canvas) continue;
           this._canvasTouches.set(t.identifier, { x: t.clientX, y: t.clientY });
+          addedAny = true;
         }
+        if (!addedAny) return;
+        e.preventDefault();
 
         if (this._canvasTouches.size === 2) {
           const pts = Array.from(this._canvasTouches.values());
@@ -372,17 +563,21 @@ export class TouchControls {
       'touchmove',
       (e) => {
         if (this._canvasTouches.size === 0) return;
-        e.preventDefault();
 
+        // Check if any changed touch belongs to our tracked canvas touches
+        let handled = false;
         if (this._canvasTouches.size === 1) {
-          const t = e.changedTouches[0];
-          const prev = this._canvasTouches.get(t.identifier);
-          if (prev) {
-            const dx = t.clientX - prev.x;
-            const dy = t.clientY - prev.y;
-            prev.x = t.clientX;
-            prev.y = t.clientY;
-            this.cb.onLookDelta?.(dx, dy);
+          for (let i = 0; i < e.changedTouches.length; i++) {
+            const t = e.changedTouches[i];
+            const prev = this._canvasTouches.get(t.identifier);
+            if (prev) {
+              const dx = t.clientX - prev.x;
+              const dy = t.clientY - prev.y;
+              prev.x = t.clientX;
+              prev.y = t.clientY;
+              this.cb.onLookDelta?.(dx, dy);
+              handled = true;
+            }
           }
         } else if (this._canvasTouches.size >= 2) {
           for (let i = 0; i < e.changedTouches.length; i++) {
@@ -391,15 +586,22 @@ export class TouchControls {
             if (prev) {
               prev.x = t.clientX;
               prev.y = t.clientY;
+              handled = true;
             }
           }
-          const pts = Array.from(this._canvasTouches.values());
-          const newDist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
-          if (this._pinchDist > 0) {
-            const delta = (this._pinchDist - newDist) * 0.035;
-            this.cb.onPinchZoom?.(delta);
+          if (handled) {
+            const pts = Array.from(this._canvasTouches.values());
+            const newDist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+            if (this._pinchDist > 0) {
+              const delta = (this._pinchDist - newDist) * 0.035;
+              this.cb.onPinchZoom?.(delta);
+            }
+            this._pinchDist = newDist;
           }
-          this._pinchDist = newDist;
+        }
+
+        if (handled) {
+          e.preventDefault();
         }
       },
       { passive: false }

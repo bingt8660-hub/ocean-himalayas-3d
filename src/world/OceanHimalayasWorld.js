@@ -86,16 +86,78 @@ const HIGH_PEAKS = [
   { id: 'east_peak', x: 162, z: -68, scale: 1.0 },
 ];
 
+// Dynamic quality presets for smooth desktop & smartphone performance
+const QUALITY_PRESETS = {
+  low: {
+    grassRatio: 0.25,
+    pineRatio: 0.48,
+    cloudBeltRatio: 0.55,
+    highCloudRatio: 0.55,
+    waterfallMistRatio: 0.5,
+    castShadow: false,
+    shadowMapSize: 1024,
+    shadowHalf: 72,
+  },
+  medium: {
+    grassRatio: 0.55,
+    pineRatio: 0.75,
+    cloudBeltRatio: 0.75,
+    highCloudRatio: 0.75,
+    waterfallMistRatio: 0.75,
+    castShadow: true,
+    shadowMapSize: 1024,
+    shadowHalf: 72,
+  },
+  high: {
+    grassRatio: 1.0,
+    pineRatio: 1.0,
+    cloudBeltRatio: 1.0,
+    highCloudRatio: 1.0,
+    waterfallMistRatio: 1.0,
+    castShadow: true,
+    shadowMapSize: 2048,
+    shadowHalf: 120,
+  },
+};
+
+function detectMobileDevice() {
+  if (typeof window === 'undefined') return false;
+  const coarsePointer =
+    typeof window.matchMedia === 'function' &&
+    window.matchMedia('(pointer: coarse)').matches;
+  const narrowTouch =
+    window.innerWidth <= 900 &&
+    ('ontouchstart' in window || (typeof navigator !== 'undefined' && navigator.maxTouchPoints > 0));
+  const mobileUA =
+    typeof navigator !== 'undefined' &&
+    /Android|iPhone|iPad|iPod|Mobile|MicroMessenger/i.test(navigator.userAgent || '');
+  return Boolean(coarsePointer || narrowTouch || mobileUA);
+}
+
 export class OceanHimalayasWorld {
   constructor(scene, renderer) {
     this.scene = scene;
     this.renderer = renderer;
+
+    // Detect coarse pointer / smartphone environment for clean mobile-first defaults
+    this._isMobile = detectMobileDevice();
+    this.qualityLevel = this._isMobile ? 'medium' : 'high';
 
     // Core shared heightfield data (1:1 with Rapier3D Heightfield collider)
     this.heightfieldData = buildHeightfieldData();
     this.sunDirection = new THREE.Vector3(0, 1, 0);
     this.currentPresetId = 'golden';
     this._time = 0;
+
+    // Instanced mesh references & original maximum instance counts for zero-jank quality scaling
+    this._pineTrunkMesh = null;
+    this._pineFoliageMesh = null;
+    this._grassMesh = null;
+    this._maxPineCount = 0;
+    this._maxGrassCount = 0;
+    this._maxCloudBeltCount = 0;
+    this._maxHighCloudCount = 0;
+    this._maxWaterfallMistCount = 0;
 
     // Animated registries updated each frame
     this._shaderUniformSets = [];
@@ -139,6 +201,9 @@ export class OceanHimalayasWorld {
     this._buildCampfires();
     this._buildUpdrafts();
 
+    // Apply initial quality preset ('medium' on mobile, 'high' on desktop)
+    this.setQualityPreset(this.qualityLevel);
+
     // Initialize world with dramatic "日照金山" (golden hour) preset
     this.setTimePreset('golden');
   }
@@ -147,12 +212,14 @@ export class OceanHimalayasWorld {
   // 1. Lighting & Fog
   // =========================================================================
   _setupLightingAndFog() {
+    const initQuality = QUALITY_PRESETS[this.qualityLevel] || QUALITY_PRESETS.medium;
+
     this.sunLight = new THREE.DirectionalLight(0xffc985, 2.8);
-    this.sunLight.castShadow = true;
-    this.sunLight.shadow.mapSize.set(2048, 2048);
+    this.sunLight.castShadow = initQuality.castShadow;
+    this.sunLight.shadow.mapSize.set(initQuality.shadowMapSize, initQuality.shadowMapSize);
     this.sunLight.shadow.camera.near = 10;
     this.sunLight.shadow.camera.far = 920;
-    const shadowHalf = 220;
+    const shadowHalf = initQuality.shadowHalf;
     this.sunLight.shadow.camera.left = -shadowHalf;
     this.sunLight.shadow.camera.right = shadowHalf;
     this.sunLight.shadow.camera.top = shadowHalf;
@@ -176,7 +243,11 @@ export class OceanHimalayasWorld {
   // 2. Sky Dome
   // =========================================================================
   _buildSkyDome() {
-    const skyGeo = new THREE.SphereGeometry(4200, 48, 32);
+    const skyGeo = new THREE.SphereGeometry(
+      4200,
+      this._isMobile ? 36 : 48,
+      this._isMobile ? 24 : 32
+    );
 
     this._skyUniforms = {
       uSunDir: { value: new THREE.Vector3(-0.7, 0.28, 0.65).normalize() },
@@ -189,6 +260,7 @@ export class OceanHimalayasWorld {
 
     const skyMat = new THREE.ShaderMaterial({
       uniforms: this._skyUniforms,
+      precision: 'highp',
       side: THREE.BackSide,
       depthWrite: false,
       fog: false,
@@ -226,22 +298,21 @@ export class OceanHimalayasWorld {
           return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
         }
 
+        // Unrolled 3-octave sky fBm (loop-free & mobile GPU friendly)
         float fbmSky(vec2 p) {
-          float s = 0.0;
-          float a = 0.52;
           mat2 m = mat2(1.65, 1.15, -1.15, 1.65);
-          for (int i = 0; i < 4; i++) {
-            s += a * vnoise(p);
-            p = m * p;
-            a *= 0.48;
-          }
+          float s = 0.56 * vnoise(p);
+          p = m * p;
+          s += 0.29 * vnoise(p);
+          p = m * p;
+          s += 0.15 * vnoise(p);
           return s;
         }
 
         void main() {
           vec3 dir = normalize(vWorldDir);
           float elev = clamp(dir.y, -0.25, 1.0);
-          float hT = pow(clamp(elev, 0.0, 1.0), 0.56);
+          float hT = pow(max(clamp(elev, 0.0, 1.0), 0.0001), 0.56);
 
           // Rich Ghibli 3-stop sky gradient (horizon -> crisp azure mid -> deep zenith)
           vec3 midSky = mix(uSkyHorizon, uSkyTop, 0.48) + vec3(-0.02, 0.05, 0.08) * (1.0 - uNight);
@@ -256,11 +327,13 @@ export class OceanHimalayasWorld {
 
           // Sun / Moon directional glow & Mie horizon scatter
           vec3 sunD = normalize(uSunDir);
-          float sunDot = max(dot(dir, sunD), 0.0);
+          float sunDot = max(dot(dir, sunD), 0.0001);
 
-          // Warm horizon Mie band concentrated near sun azimuth
+          // Warm horizon Mie band concentrated near sun azimuth (NaN-safe at zenith on mobile GPUs)
           float horizonBand = exp(-abs(dir.y) * 5.2);
-          float sunAzScatter = pow(max(dot(normalize(vec3(dir.x, 0.0, dir.z)), normalize(vec3(sunD.x, 0.0, sunD.z))), 0.0), 2.5);
+          vec2 dirXZ = dir.xz / max(length(dir.xz), 0.0001);
+          vec2 sunXZ = sunD.xz / max(length(sunD.xz), 0.0001);
+          float sunAzScatter = pow(max(dot(dirXZ, sunXZ), 0.0001), 2.5);
           float goldenFactor = (1.0 - uNight) * clamp(1.15 - sunD.y * 1.4, 0.25, 1.0);
           col += uSunColor * horizonBand * (0.22 + 0.48 * sunAzScatter) * goldenFactor;
 
@@ -547,8 +620,9 @@ export class OceanHimalayasWorld {
               float shallowMask = smoothstep(-11.0, -0.8, vTerrainWorldPos.y) * (1.0 - smoothstep(-0.2, 0.6, vTerrainWorldPos.y));
               vec2 cUv1 = vTerrainWorldPos.xz * 0.24 + vec2(uTime * 0.28, uTime * 0.19);
               vec2 cUv2 = vTerrainWorldPos.xz * 0.31 - vec2(uTime * 0.22, -uTime * 0.26);
-              float caust = pow(clamp(1.0 - abs(tNoise(cUv1) * 2.0 - 1.0), 0.0, 1.0), 3.0)
-                          + pow(clamp(1.0 - abs(tNoise(cUv2) * 2.0 - 1.0), 0.0, 1.0), 3.0);
+              float c1 = clamp(1.0 - abs(tNoise(cUv1) * 2.0 - 1.0), 0.0, 1.0);
+              float c2 = clamp(1.0 - abs(tNoise(cUv2) * 2.0 - 1.0), 0.0, 1.0);
+              float caust = c1 * c1 * c1 + c2 * c2 * c2;
               diffuseColor.rgb += vec3(0.20, 0.68, 0.72) * caust * shallowMask * (0.45 * (1.0 - uNight * 0.75));
             }
           }
@@ -629,11 +703,13 @@ export class OceanHimalayasWorld {
     heightTex.flipY = false;
     heightTex.needsUpdate = true;
 
+    // Mobile-friendly ocean tessellation (112x112 mobile / 144x144 desktop) — smooth waves matching getWaveHeight
+    const oceanSegs = this._isMobile ? 112 : 144;
     const oceanGeo = new THREE.PlaneGeometry(
       WORLD_CONFIG.OCEAN_SIZE,
       WORLD_CONFIG.OCEAN_SIZE,
-      160,
-      160
+      oceanSegs,
+      oceanSegs
     );
     oceanGeo.rotateX(-Math.PI / 2);
 
@@ -653,6 +729,7 @@ export class OceanHimalayasWorld {
 
     const oceanMat = new THREE.ShaderMaterial({
       uniforms: this._oceanUniforms,
+      precision: 'highp',
       transparent: true,
       depthWrite: false,
       vertexShader: /* glsl */ `
@@ -715,14 +792,10 @@ export class OceanHimalayasWorld {
           );
         }
 
+        // Loop-free 2-octave unrolled water fBm for crisp ripples at mobile-friendly ALU cost
         float fbmWater(vec2 p) {
-          float s = 0.0;
-          float a = 0.5;
-          for (int i = 0; i < 3; i++) {
-            s += a * noise(p);
-            p = p * 2.07 + vec2(11.3, 7.7);
-            a *= 0.5;
-          }
+          float s = 0.64 * noise(p);
+          s += 0.36 * noise(p * 2.07 + vec2(11.3, 7.7));
           return s;
         }
 
@@ -737,7 +810,7 @@ export class OceanHimalayasWorld {
           // Discard dry inland pixels cleanly (with slight shore feather)
           if (vWorldPos.y < terrainH - 0.15) discard;
 
-          // Animated high-frequency stylized ripple normals
+          // Animated high-frequency stylized ripple normals (forward differences reuse r1/r2)
           vec2 p1 = vWorldPos.xz * 0.14 + vec2(uTime * 0.36, uTime * 0.24);
           vec2 p2 = vWorldPos.xz * 0.23 - vec2(uTime * 0.28, -uTime * 0.31);
           float r1 = fbmWater(p1);
@@ -745,9 +818,9 @@ export class OceanHimalayasWorld {
           float ripple = (r1 + r2) * 0.5;
 
           float eps = 0.35;
-          float rx = fbmWater(p1 + vec2(eps, 0.0)) - fbmWater(p1 - vec2(eps, 0.0));
-          float rz = fbmWater(p2 + vec2(0.0, eps)) - fbmWater(p2 - vec2(0.0, eps));
-          vec3 N = normalize(vec3(-rx * 0.42, 1.0, -rz * 0.42));
+          float rx = fbmWater(p1 + vec2(eps, 0.0)) - r1;
+          float rz = fbmWater(p2 + vec2(0.0, eps)) - r2;
+          vec3 N = normalize(vec3(-rx * 0.84, 1.0, -rz * 0.84));
 
           vec3 V = normalize(cameraPosition - vWorldPos);
           vec3 L = normalize(uSunDir);
@@ -767,15 +840,16 @@ export class OceanHimalayasWorld {
           waterCol += mix(vec3(0.08, 0.20, 0.24), vec3(0.03, 0.07, 0.14), uNight) * waveHighlight;
 
           // Fresnel sky reflection
-          float fresnel = pow(1.0 - max(dot(N, V), 0.0), 3.6);
+          float fresnelBase = clamp(1.0 - max(dot(N, V), 0.0), 0.0001, 1.0);
+          float fresnel = pow(fresnelBase, 3.6);
           vec3 skyRefl = mix(uSkyHorizon, uSkyTop, 0.38);
           waterCol = mix(waterCol, skyRefl, clamp(fresnel * 0.72, 0.06, 0.75));
 
           // Golden sun specular glints (BotW crisp sparkle + warm path)
           vec3 H = normalize(L + V);
-          float ndh = max(dot(N, H), 0.0);
+          float ndh = max(dot(N, H), 0.0001);
           float specBroad = pow(ndh, 48.0) * (0.48 * (1.0 - uNight * 0.65));
-          float specSparkle = smoothstep(0.992, 0.999, pow(ndh, 1.0) * (0.94 + 0.12 * ripple));
+          float specSparkle = smoothstep(0.992, 0.999, ndh * (0.94 + 0.12 * ripple));
           specSparkle += pow(ndh, 320.0) * 1.65;
           waterCol += uSunColor * (specBroad + specSparkle * (1.15 - 0.55 * uNight));
 
@@ -818,12 +892,13 @@ export class OceanHimalayasWorld {
     const rng = createRng(90210);
 
     // Build a soft stylized multi-lobe cloud cluster geometry (3 overlapping puffs)
-    const lobeA = new THREE.IcosahedronGeometry(1.0, 2);
+    const cloudDetail = this._isMobile ? 1 : 2;
+    const lobeA = new THREE.IcosahedronGeometry(1.0, cloudDetail);
     lobeA.scale(1.45, 0.56, 1.15);
-    const lobeB = new THREE.IcosahedronGeometry(0.78, 2);
+    const lobeB = new THREE.IcosahedronGeometry(0.78, cloudDetail);
     lobeB.scale(1.2, 0.52, 1.0);
     lobeB.translate(0.95, -0.06, 0.22);
-    const lobeC = new THREE.IcosahedronGeometry(0.72, 2);
+    const lobeC = new THREE.IcosahedronGeometry(0.72, cloudDetail);
     lobeC.scale(1.15, 0.48, 0.95);
     lobeC.translate(-0.88, -0.09, -0.18);
     const cloudGeo = mergeSimpleGeometries([lobeA, lobeB, lobeC]);
@@ -847,6 +922,7 @@ export class OceanHimalayasWorld {
           ...this._cloudUniforms,
           uOpacity: { value: baseOpacity },
         },
+        precision: 'highp',
         transparent: true,
         depthWrite: false,
         vertexShader: /* glsl */ `
@@ -901,7 +977,9 @@ export class OceanHimalayasWorld {
             vec3 col = mix(shadowCol, litCol, shade);
 
             // Soft silver/golden forward-scattering rim when looking toward sun
-            float rim = pow(1.0 - max(dot(N, V), 0.0), 2.2) * pow(max(dot(-V, L), 0.0), 2.0);
+            float rimEdge = clamp(1.0 - max(dot(N, V), 0.0), 0.0001, 1.0);
+            float sunBack = max(dot(-V, L), 0.0001);
+            float rim = pow(rimEdge, 2.2) * (sunBack * sunBack);
             col += uSunColor * rim * (0.45 * (1.0 - uNight * 0.65));
 
             // Soften puff silhouettes with edge-facing alpha falloff
@@ -920,6 +998,7 @@ export class OceanHimalayasWorld {
     // 5a. Delicate Swirling Himalayan Cloud Sea Belt hugging the mountain waist (y ~ CLOUD_BELT_Y)
     // Kept compact around the Himalayan massif so snow peaks soar boldly above & bay sky stays clear!
     const beltCount = 110;
+    this._maxCloudBeltCount = beltCount;
     const beltMat = createCloudMaterial(0.52);
     this._cloudBeltMesh = new THREE.InstancedMesh(cloudGeo, beltMat, beltCount);
     this._cloudBeltMesh.renderOrder = 3;
@@ -962,10 +1041,20 @@ export class OceanHimalayasWorld {
         rotY,
       });
     }
+
+    // Deterministic Fisher-Yates shuffle so reducing .count thins clouds evenly 360° around peaks
+    for (let i = this._cloudRingData.length - 1; i > 0; i--) {
+      const j = Math.floor(rng() * (i + 1));
+      const tmp = this._cloudRingData[i];
+      this._cloudRingData[i] = this._cloudRingData[j];
+      this._cloudRingData[j] = tmp;
+    }
+
     this.scene.add(this._cloudBeltMesh);
 
     // 5b. High Sky Ghibli Cumulus Clusters (y ~ 285..385m)
     const highCount = 72;
+    this._maxHighCloudCount = highCount;
     const highMat = createCloudMaterial(0.72);
     this._highCloudMesh = new THREE.InstancedMesh(cloudGeo, highMat, highCount);
     this._highCloudMesh.renderOrder = 3;
@@ -1000,7 +1089,8 @@ export class OceanHimalayasWorld {
   _updateCloudMatrices(elapsedTime) {
     const dummy = this._dummy;
 
-    for (let i = 0; i < this._cloudRingData.length; i++) {
+    const beltActive = Math.min(this._cloudBeltMesh.count, this._cloudRingData.length);
+    for (let i = 0; i < beltActive; i++) {
       const c = this._cloudRingData[i];
       const a = c.angle + elapsedTime * c.orbitSpeed;
       const x = c.centerX + Math.cos(a) * c.rx;
@@ -1016,7 +1106,8 @@ export class OceanHimalayasWorld {
     this._cloudBeltMesh.instanceMatrix.needsUpdate = true;
 
     const wrapSpan = 1900;
-    for (let i = 0; i < this._highCloudData.length; i++) {
+    const highActive = Math.min(this._highCloudMesh.count, this._highCloudData.length);
+    for (let i = 0; i < highActive; i++) {
       const c = this._highCloudData[i];
       const wx = ((c.x + elapsedTime * c.driftSpeed + wrapSpan * 0.5) % wrapSpan) - wrapSpan * 0.5;
       const wy = c.y + Math.sin(elapsedTime * 0.25 + c.phase) * 2.5;
@@ -1310,12 +1401,14 @@ export class OceanHimalayasWorld {
     });
     this._mistMaterial = mistMat;
 
-    const totalMistPuffs = WATERFALLS.length * 16;
+    const puffsPerWaterfall = 16;
+    const totalMistPuffs = WATERFALLS.length * puffsPerWaterfall;
+    this._maxWaterfallMistCount = totalMistPuffs;
     this._waterfallMistMesh = new THREE.InstancedMesh(mistPuffGeo, mistMat, totalMistPuffs);
     this._waterfallMistMesh.renderOrder = 4;
     this._waterfallMistMesh.frustumCulled = false;
 
-    let mistIdx = 0;
+    const perWaterfallMist = [];
 
     for (const wf of WATERFALLS) {
       const dx = wf.bottomX - wf.topX;
@@ -1401,6 +1494,7 @@ export class OceanHimalayasWorld {
 
       const wfMat = new THREE.ShaderMaterial({
         uniforms: wfUniforms,
+        precision: 'highp',
         transparent: true,
         depthWrite: false,
         side: THREE.DoubleSide,
@@ -1496,9 +1590,9 @@ export class OceanHimalayasWorld {
       this.scene.add(splashRing);
 
       // Rising mist puffs around splash base
-      for (let m = 0; m < 16; m++) {
-        this._waterfallMistData.push({
-          idx: mistIdx++,
+      const puffs = [];
+      for (let m = 0; m < puffsPerWaterfall; m++) {
+        puffs.push({
           baseX: splashX + (rng() - 0.5) * wf.width * 1.15,
           baseZ: splashZ + (rng() - 0.5) * wf.width * 0.9,
           baseY: WORLD_CONFIG.SEA_LEVEL + 0.5,
@@ -1510,6 +1604,16 @@ export class OceanHimalayasWorld {
           baseScale: 1.4 + rng() * 1.8,
         });
       }
+      perWaterfallMist.push(puffs);
+    }
+
+    // Interleave mist puffs round-robin across waterfalls so scaling .count keeps every waterfall misty
+    for (let m = 0; m < puffsPerWaterfall; m++) {
+      for (let w = 0; w < perWaterfallMist.length; w++) {
+        const entry = perWaterfallMist[w][m];
+        entry.idx = this._waterfallMistData.length;
+        this._waterfallMistData.push(entry);
+      }
     }
 
     this.scene.add(this._waterfallMistMesh);
@@ -1518,7 +1622,8 @@ export class OceanHimalayasWorld {
 
   _updateWaterfallMist(elapsedTime) {
     const dummy = this._dummy;
-    for (let i = 0; i < this._waterfallMistData.length; i++) {
+    const activeMist = Math.min(this._waterfallMistMesh.count, this._waterfallMistData.length);
+    for (let i = 0; i < activeMist; i++) {
       const m = this._waterfallMistData[i];
       const life = (elapsedTime * m.speed + m.phase) % 1.0;
       const scale = m.baseScale * (0.55 + life * 1.35) * Math.sin(life * Math.PI);
@@ -1610,6 +1715,7 @@ export class OceanHimalayasWorld {
     }
 
     const count = placements.length;
+    this._maxPineCount = count;
     const trunks = new THREE.InstancedMesh(trunkGeo, trunkMat, count);
     const foliages = new THREE.InstancedMesh(foliageGeo, foliageMat, count);
     trunks.castShadow = true;
@@ -1643,6 +1749,8 @@ export class OceanHimalayasWorld {
     foliages.instanceMatrix.needsUpdate = true;
     if (foliages.instanceColor) foliages.instanceColor.needsUpdate = true;
 
+    this._pineTrunkMesh = trunks;
+    this._pineFoliageMesh = foliages;
     this.scene.add(trunks);
     this.scene.add(foliages);
   }
@@ -1742,6 +1850,15 @@ export class OceanHimalayasWorld {
       }
     }
 
+    // Deterministic Fisher-Yates shuffle so scaling .count thins grass uniformly across all meadows
+    for (let i = placements.length - 1; i > 0; i--) {
+      const j = Math.floor(rng() * (i + 1));
+      const tmpPlacement = placements[i];
+      placements[i] = placements[j];
+      placements[j] = tmpPlacement;
+    }
+
+    this._maxGrassCount = placements.length;
     const grassMesh = new THREE.InstancedMesh(tuftGeo, grassMat, placements.length);
     grassMesh.receiveShadow = true;
 
@@ -1765,6 +1882,7 @@ export class OceanHimalayasWorld {
 
     grassMesh.instanceMatrix.needsUpdate = true;
     if (grassMesh.instanceColor) grassMesh.instanceColor.needsUpdate = true;
+    this._grassMesh = grassMesh;
     this.scene.add(grassMesh);
   }
 
@@ -2150,6 +2268,7 @@ export class OceanHimalayasWorld {
         uFogColor: { value: new THREE.Color(0x9ec4d9) },
         uFogDensity: { value: 0.00085 },
       },
+      precision: 'highp',
       transparent: true,
       depthWrite: false,
       side: THREE.DoubleSide,
@@ -2246,6 +2365,108 @@ export class OceanHimalayasWorld {
   // =========================================================================
   // 9. Public API
   // =========================================================================
+
+  /**
+   * Dynamically scales rendering quality ('low' | 'medium' | 'high') with zero geometry rebuild.
+   * Adjusts InstancedMesh draw counts, directional shadow map size & bounds, and shadow casting.
+   */
+  setQualityPreset(level) {
+    const normalized = QUALITY_PRESETS[level] ? level : 'medium';
+    const cfg = QUALITY_PRESETS[normalized];
+    this.qualityLevel = normalized;
+
+    // 1. Scale InstancedMesh counts instantaneously (zero geometry rebuild, zero jank)
+    if (this._grassMesh && this._maxGrassCount > 0) {
+      this._grassMesh.count = Math.max(1, Math.round(this._maxGrassCount * cfg.grassRatio));
+    }
+
+    if (this._pineTrunkMesh && this._pineFoliageMesh && this._maxPineCount > 0) {
+      const pineCount = Math.max(1, Math.round(this._maxPineCount * cfg.pineRatio));
+      this._pineTrunkMesh.count = pineCount;
+      this._pineFoliageMesh.count = pineCount;
+    }
+
+    if (this._cloudBeltMesh && this._maxCloudBeltCount > 0) {
+      this._cloudBeltMesh.count = Math.max(1, Math.round(this._maxCloudBeltCount * cfg.cloudBeltRatio));
+    }
+
+    if (this._highCloudMesh && this._maxHighCloudCount > 0) {
+      this._highCloudMesh.count = Math.max(1, Math.round(this._maxHighCloudCount * cfg.highCloudRatio));
+    }
+
+    // Refresh active cloud matrices immediately so scaling up never shows un-updated instances
+    if (this._cloudBeltMesh && this._highCloudMesh) {
+      this._updateCloudMatrices(this._time);
+    }
+
+    if (this._waterfallMistMesh && this._maxWaterfallMistCount > 0) {
+      this._waterfallMistMesh.count = Math.max(
+        WATERFALLS.length,
+        Math.round(this._maxWaterfallMistCount * cfg.waterfallMistRatio)
+      );
+      this._updateWaterfallMist(this._time);
+    }
+
+    // 2. Update directional sun shadows & dispose old shadow map cleanly when resizing or disabling
+    if (this.sunLight) {
+      const prevCastShadow = this.sunLight.castShadow;
+      this.sunLight.castShadow = cfg.castShadow;
+
+      const cam = this.sunLight.shadow.camera;
+      if (
+        cam.left !== -cfg.shadowHalf ||
+        cam.right !== cfg.shadowHalf ||
+        cam.top !== cfg.shadowHalf ||
+        cam.bottom !== -cfg.shadowHalf
+      ) {
+        cam.left = -cfg.shadowHalf;
+        cam.right = cfg.shadowHalf;
+        cam.top = cfg.shadowHalf;
+        cam.bottom = -cfg.shadowHalf;
+        this._shadowFrustumSize = cfg.shadowHalf * 2;
+      }
+
+      const mapSizeChanged =
+        this.sunLight.shadow.mapSize.width !== cfg.shadowMapSize ||
+        this.sunLight.shadow.mapSize.height !== cfg.shadowMapSize;
+
+      if (mapSizeChanged) {
+        this.sunLight.shadow.map?.dispose();
+        this.sunLight.shadow.map = null;
+        this.sunLight.shadow.mapPass?.dispose?.();
+        this.sunLight.shadow.mapPass = null;
+        this.sunLight.shadow.mapSize.set(cfg.shadowMapSize, cfg.shadowMapSize);
+      } else if (!cfg.castShadow && this.sunLight.shadow.map) {
+        this.sunLight.shadow.map.dispose();
+        this.sunLight.shadow.map = null;
+        this.sunLight.shadow.mapPass?.dispose?.();
+        this.sunLight.shadow.mapPass = null;
+      }
+
+      cam.updateProjectionMatrix();
+
+      if (this.renderer && this.renderer.shadowMap) {
+        const prevRendererShadow = this.renderer.shadowMap.enabled;
+        this.renderer.shadowMap.enabled = cfg.castShadow;
+        this.renderer.shadowMap.needsUpdate = true;
+
+        // Recompile lit/VRM materials cleanly whenever shadow mapping toggles on/off
+        if (prevRendererShadow !== cfg.castShadow || prevCastShadow !== cfg.castShadow) {
+          this.scene.traverse((obj) => {
+            if (!obj.isMesh || !obj.material) return;
+            const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
+            for (const mat of mats) {
+              if (mat && (mat.isMeshStandardMaterial || mat.isMToonMaterial || mat.lights)) {
+                mat.needsUpdate = true;
+              }
+            }
+          });
+        }
+      }
+    }
+
+    return this.qualityLevel;
+  }
 
   /**
    * Switch time-of-day atmosphere preset ('golden' | 'morning' | 'noon' | 'night').
@@ -2424,22 +2645,24 @@ export class OceanHimalayasWorld {
         this.skyDome.position.copy(cameraPos);
       }
 
-      // Snap shadow camera target to coarse world texel grid to prevent shadow swimming
-      const texelStep = this._shadowFrustumSize / 128;
-      const targetX = Math.round(cameraPos.x / texelStep) * texelStep;
-      const targetY = Math.round(clamp(cameraPos.y, 0, 220) / texelStep) * texelStep;
-      const targetZ = Math.round(cameraPos.z / texelStep) * texelStep;
+      if (this.sunLight && this.sunLight.castShadow) {
+        // Snap shadow camera target to coarse world texel grid to prevent shadow swimming
+        const texelStep = this._shadowFrustumSize / 128;
+        const targetX = Math.round(cameraPos.x / texelStep) * texelStep;
+        const targetY = Math.round(clamp(cameraPos.y, 0, 220) / texelStep) * texelStep;
+        const targetZ = Math.round(cameraPos.z / texelStep) * texelStep;
 
-      const lerpAlpha = Math.min(1, dt > 0 ? dt * 6.0 : 1.0);
-      this._shadowTarget.x += (targetX - this._shadowTarget.x) * lerpAlpha;
-      this._shadowTarget.y += (targetY - this._shadowTarget.y) * lerpAlpha;
-      this._shadowTarget.z += (targetZ - this._shadowTarget.z) * lerpAlpha;
+        const lerpAlpha = Math.min(1, dt > 0 ? dt * 6.0 : 1.0);
+        this._shadowTarget.x += (targetX - this._shadowTarget.x) * lerpAlpha;
+        this._shadowTarget.y += (targetY - this._shadowTarget.y) * lerpAlpha;
+        this._shadowTarget.z += (targetZ - this._shadowTarget.z) * lerpAlpha;
 
-      this.sunLight.target.position.copy(this._shadowTarget);
-      this.sunLight.position
-        .copy(this._shadowTarget)
-        .addScaledVector(this.sunDirection, 420);
-      this.sunLight.target.updateMatrixWorld();
+        this.sunLight.target.position.copy(this._shadowTarget);
+        this.sunLight.position
+          .copy(this._shadowTarget)
+          .addScaledVector(this.sunDirection, 420);
+        this.sunLight.target.updateMatrixWorld();
+      }
     }
   }
 }

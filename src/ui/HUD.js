@@ -1,7 +1,8 @@
 /**
  * BotW-inspired HUD & Interactive Controls for "海中喜马拉雅" (Ocean Himalayas 3D).
  * Manages Welcome Overlay, Compass & Altimeter, Biome Discovery Banner, Stamina Wheel,
- * Ultrahand Context Prompt, Quick-Spawn Dock, Control Strip, Help Panel, and Toasts.
+ * Ultrahand Context Prompt, Quick-Spawn Dock, Desktop Control Strip, Streamlined Mobile Top Bar,
+ * 2-Column Teleport Sheet, Frosted Mobile Settings Drawer, VRM Loading Pill, Help Panel, and Toasts.
  */
 
 import { WORLD_CONFIG, CHARACTER_MODELS, PROP_CATALOG } from '../config/worldConfig.js';
@@ -32,6 +33,12 @@ const TIME_BUTTONS = [
   { id: 'night', label: '星夜' },
 ];
 
+const QUALITY_OPTIONS = [
+  { id: 'low', label: '流畅 (省电)' },
+  { id: 'medium', label: '均衡 (推荐)' },
+  { id: 'high', label: '极致' },
+];
+
 const TELEPORT_ORDER = [
   'bay_camp',
   'beach_raft',
@@ -40,6 +47,15 @@ const TELEPORT_ORDER = [
   'main_summit',
   'sky_sanctuary',
 ];
+
+const LANDMARK_ICONS = {
+  bay_camp: '🏕️',
+  beach_raft: '🛶',
+  waterfall_cliff: '🌊',
+  alpine_ruins: '🏛️',
+  main_summit: '🏔️',
+  sky_sanctuary: '✨',
+};
 
 const BIOME_SUBTITLES = {
   ocean: 'AZURE CORAL SEA',
@@ -75,12 +91,21 @@ const STAMINA_RADIUS = 20;
 const STAMINA_CIRCUMFERENCE = 2 * Math.PI * STAMINA_RADIUS;
 
 function wrapAngleDeg(deg) {
-  let d = ((deg + 180) % 360 + 360) % 360 - 180;
+  let d = (((deg + 180) % 360) + 360) % 360 - 180;
   return d;
 }
 
 function hexToCss(hexNum) {
   return `#${Number(hexNum).toString(16).padStart(6, '0')}`;
+}
+
+function isFullscreenSupported() {
+  if (typeof document === 'undefined') return false;
+  const docEl = document.documentElement;
+  return Boolean(
+    (document.fullscreenEnabled || document.webkitFullscreenEnabled) &&
+      (docEl?.requestFullscreen || docEl?.webkitRequestFullscreen)
+  );
 }
 
 export class HUD {
@@ -92,9 +117,16 @@ export class HUD {
     this._welcomeVisible = true;
     this._helpOpen = false;
     this._teleportOpen = false;
+    this._mobileTeleportOpen = false;
+    this._settingsOpen = false;
     this._muted = false;
+    this._touchActive = false;
+    this._fullscreen = false;
+    this._fullscreenSupported = isFullscreenSupported();
     this._activeTimeId = 'golden';
+    this._activeQualityId = 'medium';
     this._activeCharIndex = 0;
+    this._sensitivity = 1.0;
 
     // Cached render state to minimize DOM writes
     this._lastAltText = '';
@@ -102,6 +134,7 @@ export class HUD {
     this._lastBiomeId = null;
     this._biomeCooldown = 0;
     this._biomeBannerTimer = null;
+    this._modelPillHideTimer = null;
     this._lastPromptKey = '';
     this._lastModeKey = '';
     this._prevStamina = 100;
@@ -111,6 +144,9 @@ export class HUD {
     this._compassPins = [];
     this._spawnSlots = new Map();
     this._timeButtons = new Map();
+    this._drawerTimeButtons = new Map();
+    this._qualityButtons = new Map();
+    this._charButtons = new Map();
 
     this._buildDOM();
     this._bindGlobalDismiss();
@@ -121,6 +157,21 @@ export class HUD {
     this.root.className = 'oh-hud';
 
     const propList = Object.values(PROP_CATALOG);
+    const teleportCardsHtml = TELEPORT_ORDER.map((id) => {
+      const lm = LANDMARKS[id];
+      if (!lm) return '';
+      const dispAlt = Math.max(0, Math.round(lm.y * WORLD_CONFIG.ALTITUDE_DISPLAY_SCALE));
+      const icon = LANDMARK_ICONS[id] || '📍';
+      return `
+        <button class="oh-tp-card" type="button" data-landmark-id="${lm.id}">
+          <span class="oh-tp-card-ico">${icon}</span>
+          <span class="oh-tp-card-body">
+            <span class="oh-tp-card-name">${lm.shortName || lm.name}</span>
+            <span class="oh-tp-card-alt">海拔 ${dispAlt.toLocaleString()} m</span>
+          </span>
+        </button>
+      `;
+    }).join('');
 
     this.root.innerHTML = `
       <!-- 1. Loading / Welcome Overlay -->
@@ -148,6 +199,16 @@ export class HUD {
             <span><kbd class="oh-kbd">1-7</kbd> 召唤部件</span>
             <span><kbd class="oh-kbd">T</kbd> 启动机关</span>
           </div>
+          <div class="oh-welcome-mobile-hints">
+            <span>左屏摇杆移动</span>
+            <span>·</span>
+            <span>右屏滑动转视角</span>
+            <span>·</span>
+            <span>空中点伞滑翔</span>
+            <span>·</span>
+            <span>抓物粘合造载具</span>
+          </div>
+          <div class="oh-portrait-tip">📱 横屏游玩体验更佳</div>
         </div>
       </div>
 
@@ -164,6 +225,17 @@ export class HUD {
           <span class="oh-strip-sep"></span>
           <span class="oh-biome-pill" data-ref="biomeLabel">珊瑚海湾沙滩</span>
           <span class="oh-mode-badge" data-ref="modeBadge"></span>
+        </div>
+      </div>
+
+      <!-- 2b. Subtle Non-Blocking VRM Model Loading Pill -->
+      <div class="oh-model-pill" data-ref="modelPill">
+        <span class="oh-model-dot"></span>
+        <div class="oh-model-meta">
+          <span class="oh-model-label" data-ref="modelPillLabel">正在加载角色模型...</span>
+          <div class="oh-model-bar-wrap">
+            <div class="oh-model-bar" data-ref="modelPillBar"></div>
+          </div>
         </div>
       </div>
 
@@ -202,8 +274,8 @@ export class HUD {
       </div>
       <div class="oh-context-prompt" data-ref="contextPrompt"></div>
 
-      <!-- 6. Bottom Quick-Spawn Dock (1-7 + Activate) -->
-      <div class="oh-dock-wrap">
+      <!-- 6. Bottom Quick-Spawn Dock (Desktop 1-7 + Activate) -->
+      <div class="oh-dock-wrap" data-ref="dockWrap">
         <div class="oh-dock" data-ref="spawnDock">
           ${propList
             .map(
@@ -229,9 +301,10 @@ export class HUD {
         </button>
       </div>
 
-      <!-- 7. Top-Right Compact Control Strip -->
-      <div class="oh-top-right">
-        <div class="oh-ctrl-row">
+      <!-- 7. Top-Right Control Strip (Desktop full strip + Mobile 3-button streamlined bar) -->
+      <div class="oh-top-right" data-ref="topRight">
+        <!-- Desktop Full Bar -->
+        <div class="oh-ctrl-row oh-ctrl-row-desktop">
           <div class="oh-pill-group" data-ref="timeGroup">
             ${TIME_BUTTONS.map(
               (t) =>
@@ -257,7 +330,7 @@ export class HUD {
           </div>
 
           <button class="oh-icon-btn" type="button" data-ref="charBtn" title="切换探索者角色模型">
-            Seed-san ⇄
+            VRoid ⇄
           </button>
 
           <button class="oh-icon-btn" type="button" data-ref="touchBtn" title="开启 / 关闭手机虚拟按键">
@@ -273,8 +346,105 @@ export class HUD {
           </button>
         </div>
 
+        <!-- Mobile Streamlined 3-Button Bar -->
+        <div class="oh-ctrl-row oh-ctrl-row-mobile">
+          <button class="oh-mob-btn" type="button" data-ref="mobTeleportBtn" aria-label="传送">
+            <span>📍</span><span class="oh-mob-btn-txt">传送</span>
+          </button>
+          <button class="oh-mob-btn" type="button" data-ref="mobSettingsBtn" aria-label="设置">
+            <span>⚙️</span><span class="oh-mob-btn-txt">设置</span>
+          </button>
+          <button class="oh-mob-btn is-icon-only" type="button" data-ref="mobQuickBtn" aria-label="${this._fullscreenSupported ? '全屏' : '音效'}">
+            ${this._fullscreenSupported ? '⛶' : '🔊'}
+          </button>
+        </div>
+
         <div class="oh-stats-pill" data-ref="statsPill">
           60 FPS · 0 物体 · 0 粘合
+        </div>
+      </div>
+
+      <!-- 7b. Mobile Sheet Backdrop -->
+      <div class="oh-sheet-backdrop" data-ref="sheetBackdrop"></div>
+
+      <!-- 7c. Mobile 2-Column Teleport Sheet -->
+      <div class="oh-teleport-sheet" data-ref="teleportSheet">
+        <div class="oh-sheet-header">
+          <span class="oh-sheet-title">📍 地标快速传送</span>
+          <button class="oh-sheet-close" type="button" data-ref="teleportSheetClose">×</button>
+        </div>
+        <div class="oh-tp-grid" data-ref="teleportSheetGrid">
+          ${teleportCardsHtml}
+        </div>
+      </div>
+
+      <!-- 7d. Sleek Frosted Mobile Settings Drawer -->
+      <div class="oh-settings-drawer" data-ref="settingsDrawer">
+        <div class="oh-sheet-header">
+          <span class="oh-sheet-title">⚙️ 游戏设置</span>
+          <button class="oh-sheet-close" type="button" data-ref="settingsClose">×</button>
+        </div>
+
+        <div class="oh-settings-scroll">
+          <div class="oh-setting-block">
+            <div class="oh-setting-label">画质档位</div>
+            <div class="oh-seg-group" data-ref="qualityGroup">
+              ${QUALITY_OPTIONS.map(
+                (q) =>
+                  `<button class="oh-seg-btn${q.id === 'medium' ? ' is-active' : ''}" type="button" data-quality-id="${q.id}">${q.label}</button>`
+              ).join('')}
+            </div>
+          </div>
+
+          <div class="oh-setting-block">
+            <div class="oh-setting-label-row">
+              <span class="oh-setting-label">视角灵敏度</span>
+              <span class="oh-setting-val" data-ref="sensValue">1.00x</span>
+            </div>
+            <input
+              class="oh-range"
+              type="range"
+              min="0.5"
+              max="2.0"
+              step="0.05"
+              value="1.0"
+              data-ref="sensSlider"
+            />
+          </div>
+
+          <div class="oh-setting-block">
+            <div class="oh-setting-label">天色时间</div>
+            <div class="oh-seg-group is-4col" data-ref="drawerTimeGroup">
+              ${TIME_BUTTONS.map(
+                (t) =>
+                  `<button class="oh-seg-btn${t.id === 'golden' ? ' is-active' : ''}" type="button" data-time-id="${t.id}">${t.label}</button>`
+              ).join('')}
+            </div>
+          </div>
+
+          <div class="oh-setting-block">
+            <div class="oh-setting-label">角色切换</div>
+            <div class="oh-seg-group is-2col" data-ref="drawerCharGroup">
+              ${CHARACTER_MODELS.map(
+                (m, i) =>
+                  `<button class="oh-seg-btn${i === 0 ? ' is-active' : ''}" type="button" data-char-id="${m.id}">${m.name}</button>`
+              ).join('')}
+            </div>
+          </div>
+
+          <div class="oh-setting-block">
+            <div class="oh-setting-label">快捷开关</div>
+            <div class="oh-quick-grid">
+              <button class="oh-quick-chip" type="button" data-ref="drawerMuteBtn">🔊 音效已开</button>
+              <button class="oh-quick-chip" type="button" data-ref="drawerTouchBtn">🎮 虚拟按键</button>
+              <button class="oh-quick-chip" type="button" data-ref="drawerFullscreenBtn">⛶ 全屏模式</button>
+              <button class="oh-quick-chip" type="button" data-ref="drawerHelpBtn">📖 操作指南</button>
+            </div>
+          </div>
+
+          <div class="oh-drawer-footer" data-ref="drawerStats">
+            60 FPS · 0 物体 · 0 粘合
+          </div>
         </div>
       </div>
 
@@ -286,7 +456,17 @@ export class HUD {
         </div>
 
         <div class="oh-help-section">
-          <div class="oh-help-section-title">探索与滑翔</div>
+          <div class="oh-help-section-title">触屏操作 (手机 / 平板)</div>
+          <div class="oh-help-list">
+            <div class="oh-help-row"><span>浮动摇杆移动 / 推满疾跑</span><span>左下屏滑动</span></div>
+            <div class="oh-help-row"><span>旋转视角 / 缩放镜头</span><span>右屏单指 / 双指捏合</span></div>
+            <div class="oh-help-row"><span>跳跃 / 空中开合滑翔伞</span><span>右下主按钮</span></div>
+            <div class="oh-help-row"><span>一键整车与部件召唤</span><span>左侧「📦 召唤」</span></div>
+          </div>
+        </div>
+
+        <div class="oh-help-section">
+          <div class="oh-help-section-title">键鼠探索与滑翔</div>
           <div class="oh-help-list">
             <div class="oh-help-row"><span>移动 / 奔跑</span><span><kbd class="oh-kbd">WASD</kbd> + <kbd class="oh-kbd">Shift</kbd></span></div>
             <div class="oh-help-row"><span>跳跃 / 空中开合滑翔伞</span><span><kbd class="oh-kbd">Space</kbd></span></div>
@@ -304,13 +484,6 @@ export class HUD {
             <div class="oh-help-row"><span>拆开粘合连接</span><span><kbd class="oh-kbd">X</kbd></span></div>
             <div class="oh-help-row"><span>旋转 / 推拉 / 投掷</span><span><kbd class="oh-kbd">Q/R</kbd> · 滚轮 · 左键</span></div>
             <div class="oh-help-row"><span>启停附近风扇/轮/火箭/桶</span><span><kbd class="oh-kbd">T</kbd></span></div>
-          </div>
-        </div>
-
-        <div class="oh-help-section">
-          <div class="oh-help-section-title">快捷功能</div>
-          <div class="oh-help-list">
-            <div class="oh-help-row"><span>静音切换 / 操作指南</span><span><kbd class="oh-kbd">M</kbd> / <kbd class="oh-kbd">H</kbd></span></div>
           </div>
         </div>
       </div>
@@ -340,6 +513,9 @@ export class HUD {
       altValue: ref('altValue'),
       biomeLabel: ref('biomeLabel'),
       modeBadge: ref('modeBadge'),
+      modelPill: ref('modelPill'),
+      modelPillLabel: ref('modelPillLabel'),
+      modelPillBar: ref('modelPillBar'),
       biomeBanner: ref('biomeBanner'),
       biomeBannerTitle: ref('biomeBannerTitle'),
       biomeBannerSub: ref('biomeBannerSub'),
@@ -347,15 +523,37 @@ export class HUD {
       staminaArc: ref('staminaArc'),
       crosshair: ref('crosshair'),
       contextPrompt: ref('contextPrompt'),
+      dockWrap: ref('dockWrap'),
       spawnDock: ref('spawnDock'),
       activateBtn: ref('activateBtn'),
+      topRight: ref('topRight'),
       timeGroup: ref('timeGroup'),
       teleportDropdown: ref('teleportDropdown'),
       teleportToggle: ref('teleportToggle'),
       teleportMenu: ref('teleportMenu'),
       charBtn: ref('charBtn'),
+      touchBtn: ref('touchBtn'),
       muteBtn: ref('muteBtn'),
       helpBtn: ref('helpBtn'),
+      mobTeleportBtn: ref('mobTeleportBtn'),
+      mobSettingsBtn: ref('mobSettingsBtn'),
+      mobQuickBtn: ref('mobQuickBtn'),
+      sheetBackdrop: ref('sheetBackdrop'),
+      teleportSheet: ref('teleportSheet'),
+      teleportSheetClose: ref('teleportSheetClose'),
+      teleportSheetGrid: ref('teleportSheetGrid'),
+      settingsDrawer: ref('settingsDrawer'),
+      settingsClose: ref('settingsClose'),
+      qualityGroup: ref('qualityGroup'),
+      sensSlider: ref('sensSlider'),
+      sensValue: ref('sensValue'),
+      drawerTimeGroup: ref('drawerTimeGroup'),
+      drawerCharGroup: ref('drawerCharGroup'),
+      drawerMuteBtn: ref('drawerMuteBtn'),
+      drawerTouchBtn: ref('drawerTouchBtn'),
+      drawerFullscreenBtn: ref('drawerFullscreenBtn'),
+      drawerHelpBtn: ref('drawerHelpBtn'),
+      drawerStats: ref('drawerStats'),
       helpPanel: ref('helpPanel'),
       helpClose: ref('helpClose'),
       statsPill: ref('statsPill'),
@@ -365,8 +563,31 @@ export class HUD {
       errorDetail: ref('errorDetail'),
     };
 
+    if (!this._fullscreenSupported && this.el.drawerFullscreenBtn) {
+      this.el.drawerFullscreenBtn.style.opacity = '0.52';
+    }
+
     this._initCompassElements();
     this._bindControls();
+    this._isolateInteractivePanels();
+  }
+
+  /** Prevents any touch/pointer event on interactive HUD containers from leaking to canvas look */
+  _isolateInteractivePanels() {
+    const panels = [
+      this.el.topRight,
+      this.el.dockWrap,
+      this.el.helpPanel,
+      this.el.sheetBackdrop,
+      this.el.teleportSheet,
+      this.el.settingsDrawer,
+      this.el.welcome,
+    ];
+    for (const panel of panels) {
+      if (!panel) continue;
+      panel.addEventListener('touchstart', (e) => e.stopPropagation(), { passive: true });
+      panel.addEventListener('pointerdown', (e) => e.stopPropagation(), { passive: true });
+    }
   }
 
   _initCompassElements() {
@@ -401,7 +622,7 @@ export class HUD {
     this.el.startBtn.addEventListener('click', handleStart);
     this.el.welcome.addEventListener('click', handleStart);
 
-    // Time-of-Day buttons
+    // Desktop Time-of-Day buttons
     this.el.timeGroup.querySelectorAll('[data-time-id]').forEach((btn) => {
       const id = btn.dataset.timeId;
       this._timeButtons.set(id, btn);
@@ -412,7 +633,18 @@ export class HUD {
       });
     });
 
-    // Teleport dropdown
+    // Mobile Settings Drawer Time-of-Day buttons
+    this.el.drawerTimeGroup.querySelectorAll('[data-time-id]').forEach((btn) => {
+      const id = btn.dataset.timeId;
+      this._drawerTimeButtons.set(id, btn);
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        this.setActiveTimePreset(id);
+        this.callbacks.onTimePreset?.(id);
+      });
+    });
+
+    // Desktop Teleport dropdown
     this.el.teleportToggle.addEventListener('click', (e) => {
       e.stopPropagation();
       this._teleportOpen = !this._teleportOpen;
@@ -429,7 +661,70 @@ export class HUD {
       });
     });
 
-    // Character switcher
+    // Mobile Teleport Sheet
+    this.el.mobTeleportBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      this.toggleTeleportSheet();
+    });
+    this.el.teleportSheetClose.addEventListener('click', (e) => {
+      e.stopPropagation();
+      this.closeMobileSheets();
+    });
+    this.el.teleportSheetGrid.querySelectorAll('[data-landmark-id]').forEach((btn) => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const lmId = btn.dataset.landmarkId;
+        this.closeMobileSheets();
+        this.callbacks.onTeleport?.(lmId);
+      });
+    });
+
+    // Mobile Settings Drawer
+    this.el.mobSettingsBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      this.toggleSettingsDrawer();
+    });
+    this.el.settingsClose.addEventListener('click', (e) => {
+      e.stopPropagation();
+      this.closeMobileSheets();
+    });
+    this.el.sheetBackdrop.addEventListener('click', (e) => {
+      e.stopPropagation();
+      this.closeMobileSheets();
+    });
+
+    // Mobile 3rd Quick Button (Fullscreen if supported, else Mute)
+    this.el.mobQuickBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (this._fullscreenSupported) {
+        this.callbacks.onToggleFullscreen?.();
+      } else {
+        this._handleMuteClick();
+      }
+    });
+
+    // Quality Preset Buttons in Settings Drawer
+    this.el.qualityGroup.querySelectorAll('[data-quality-id]').forEach((btn) => {
+      const id = btn.dataset.qualityId;
+      this._qualityButtons.set(id, btn);
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        this.setQualityPreset(id);
+        this.callbacks.onQualityChange?.(id);
+      });
+    });
+
+    // Sensitivity Range Slider
+    this.el.sensSlider.addEventListener('input', (e) => {
+      e.stopPropagation();
+      const val = parseFloat(e.target.value);
+      if (!Number.isFinite(val)) return;
+      this._sensitivity = val;
+      this.el.sensValue.textContent = `${val.toFixed(2)}x`;
+      this.callbacks.onSensitivityChange?.(val);
+    });
+
+    // Character Switcher (Desktop button + Mobile Drawer buttons)
     this.el.charBtn.addEventListener('click', (e) => {
       e.stopPropagation();
       this._activeCharIndex = (this._activeCharIndex + 1) % CHARACTER_MODELS.length;
@@ -438,30 +733,54 @@ export class HUD {
       this.callbacks.onSwitchCharacter?.(nextModel);
     });
 
-    // Virtual touch controls toggle
-    this.el.touchBtn?.addEventListener('click', (e) => {
+    this.el.drawerCharGroup.querySelectorAll('[data-char-id]').forEach((btn) => {
+      const id = btn.dataset.charId;
+      this._charButtons.set(id, btn);
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const model = CHARACTER_MODELS.find((m) => m.id === id);
+        if (!model) return;
+        this.setActiveCharacter(model.id);
+        this.callbacks.onSwitchCharacter?.(model);
+      });
+    });
+
+    // Virtual touch controls toggle (Desktop + Drawer)
+    const handleTouchToggle = (e) => {
       e.stopPropagation();
       const nextTouch = this.callbacks.onToggleTouch?.();
       if (typeof nextTouch === 'boolean') {
         this.setTouchActive(nextTouch);
       }
-    });
+    };
+    this.el.touchBtn?.addEventListener('click', handleTouchToggle);
+    this.el.drawerTouchBtn?.addEventListener('click', handleTouchToggle);
 
-    // Mute button
+    // Mute buttons (Desktop + Drawer)
     this.el.muteBtn.addEventListener('click', (e) => {
       e.stopPropagation();
-      const nextMuted = this.callbacks.onToggleMute?.();
-      if (typeof nextMuted === 'boolean') {
-        this.setMuted(nextMuted);
-      } else {
-        this.setMuted(!this._muted);
-      }
+      this._handleMuteClick();
+    });
+    this.el.drawerMuteBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      this._handleMuteClick();
     });
 
-    // Help toggle
+    // Fullscreen button in Settings Drawer
+    this.el.drawerFullscreenBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      this.callbacks.onToggleFullscreen?.();
+    });
+
+    // Help toggle (Desktop + Drawer)
     this.el.helpBtn.addEventListener('click', (e) => {
       e.stopPropagation();
       this.toggleHelp();
+    });
+    this.el.drawerHelpBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      this.closeMobileSheets();
+      this.toggleHelp(true);
     });
     this.el.helpClose.addEventListener('click', (e) => {
       e.stopPropagation();
@@ -486,6 +805,15 @@ export class HUD {
     });
   }
 
+  _handleMuteClick() {
+    const nextMuted = this.callbacks.onToggleMute?.();
+    if (typeof nextMuted === 'boolean') {
+      this.setMuted(nextMuted);
+    } else {
+      this.setMuted(!this._muted);
+    }
+  }
+
   _bindGlobalDismiss() {
     window.addEventListener('click', () => {
       if (this._teleportOpen) {
@@ -495,7 +823,43 @@ export class HUD {
     });
   }
 
+  _syncSheetBackdrop() {
+    const anyOpen = this._mobileTeleportOpen || this._settingsOpen;
+    this.el.sheetBackdrop.classList.toggle('is-open', anyOpen);
+    this.el.teleportSheet.classList.toggle('is-open', this._mobileTeleportOpen);
+    this.el.settingsDrawer.classList.toggle('is-open', this._settingsOpen);
+    this.el.mobTeleportBtn.classList.toggle('is-active', this._mobileTeleportOpen);
+    this.el.mobSettingsBtn.classList.toggle('is-active', this._settingsOpen);
+  }
+
   // ==================== PUBLIC API ====================
+
+  toggleTeleportSheet(force) {
+    const next = typeof force === 'boolean' ? force : !this._mobileTeleportOpen;
+    this._mobileTeleportOpen = next;
+    if (next) {
+      this._settingsOpen = false;
+      this.toggleHelp(false);
+    }
+    this._syncSheetBackdrop();
+  }
+
+  toggleSettingsDrawer(force) {
+    const next = typeof force === 'boolean' ? force : !this._settingsOpen;
+    this._settingsOpen = next;
+    if (next) {
+      this._mobileTeleportOpen = false;
+      this.toggleHelp(false);
+    }
+    this._syncSheetBackdrop();
+  }
+
+  closeMobileSheets() {
+    if (!this._mobileTeleportOpen && !this._settingsOpen) return;
+    this._mobileTeleportOpen = false;
+    this._settingsOpen = false;
+    this._syncSheetBackdrop();
+  }
 
   setLoadingProgress(percent, message) {
     const clamped = Math.max(0, Math.min(100, percent));
@@ -510,7 +874,7 @@ export class HUD {
     this.el.progressBar.style.width = '100%';
     this.el.loadingStatus.textContent = '世界已就绪 · 推荐佩戴耳机体验海浪与高山风声';
     this.el.startBtn.disabled = false;
-    this.el.startBtn.innerHTML = '<span>点击画面进入探索</span>';
+    this.el.startBtn.innerHTML = '<span>进入喜马拉雅</span>';
   }
 
   dismissWelcome() {
@@ -523,9 +887,80 @@ export class HUD {
     return this._welcomeVisible;
   }
 
+  /**
+   * Controls the subtle non-blocking VRM loading pill during mobile network downloads.
+   * @param {number|null|false} pct - 0..100 for determinate progress, null for indeterminate, false to hide
+   * @param {string} [label]
+   */
+  setModelLoading(pct, label = '加载角色模型') {
+    if (!this.el.modelPill) return;
+    if (this._modelPillHideTimer) {
+      clearTimeout(this._modelPillHideTimer);
+      this._modelPillHideTimer = null;
+    }
+
+    if (pct === false || pct === 'done') {
+      this.el.modelPill.classList.remove('is-visible', 'is-indeterminate');
+      return;
+    }
+
+    this.el.modelPill.classList.add('is-visible');
+
+    if (pct === null || pct === undefined || !Number.isFinite(Number(pct))) {
+      this.el.modelPill.classList.add('is-indeterminate');
+      this.el.modelPillLabel.textContent = label || '正在加载角色模型...';
+      this.el.modelPillBar.style.width = '45%';
+      return;
+    }
+
+    const clamped = Math.max(0, Math.min(100, Math.round(Number(pct))));
+    this.el.modelPill.classList.remove('is-indeterminate');
+    this.el.modelPillLabel.textContent = `${label || '加载角色模型'} ${clamped}%`;
+    this.el.modelPillBar.style.width = `${clamped}%`;
+
+    if (clamped >= 100) {
+      this._modelPillHideTimer = setTimeout(() => {
+        this.el.modelPill.classList.remove('is-visible', 'is-indeterminate');
+      }, 650);
+    }
+  }
+
+  setQualityPreset(presetId) {
+    this._activeQualityId = presetId;
+    this._qualityButtons.forEach((btn, id) => {
+      btn.classList.toggle('is-active', id === presetId);
+    });
+  }
+
+  setSensitivity(mult) {
+    const val = Math.max(0.5, Math.min(2.0, Number(mult) || 1.0));
+    this._sensitivity = val;
+    if (this.el.sensSlider) {
+      this.el.sensSlider.value = val.toFixed(2);
+    }
+    if (this.el.sensValue) {
+      this.el.sensValue.textContent = `${val.toFixed(2)}x`;
+    }
+  }
+
+  setFullscreenState(isFullscreen) {
+    this._fullscreen = Boolean(isFullscreen);
+    if (this._fullscreenSupported && this.el.mobQuickBtn) {
+      this.el.mobQuickBtn.textContent = this._fullscreen ? '⤢' : '⛶';
+      this.el.mobQuickBtn.classList.toggle('is-active', this._fullscreen);
+    }
+    if (this.el.drawerFullscreenBtn) {
+      this.el.drawerFullscreenBtn.textContent = this._fullscreen ? '⤢ 退出全屏' : '⛶ 全屏模式';
+      this.el.drawerFullscreenBtn.classList.toggle('is-active', this._fullscreen);
+    }
+  }
+
   setActiveTimePreset(presetId) {
     this._activeTimeId = presetId;
     this._timeButtons.forEach((btn, id) => {
+      btn.classList.toggle('is-active', id === presetId);
+    });
+    this._drawerTimeButtons.forEach((btn, id) => {
       btn.classList.toggle('is-active', id === presetId);
     });
   }
@@ -535,16 +970,32 @@ export class HUD {
     if (idx >= 0) this._activeCharIndex = idx;
     const shortLabel = modelId === 'heroine' ? 'VRoid ⇄' : 'Seed-san ⇄';
     this.el.charBtn.textContent = shortLabel;
+    this._charButtons.forEach((btn, id) => {
+      btn.classList.toggle('is-active', id === modelId);
+    });
   }
 
   setTouchActive(active) {
-    this.el.touchBtn?.classList.toggle('is-active', Boolean(active));
+    this._touchActive = Boolean(active);
+    this.el.touchBtn?.classList.toggle('is-active', this._touchActive);
+    if (this.el.drawerTouchBtn) {
+      this.el.drawerTouchBtn.textContent = this._touchActive ? '🎮 虚拟按键：开' : '🎮 虚拟按键：关';
+      this.el.drawerTouchBtn.classList.toggle('is-active', this._touchActive);
+    }
   }
 
   setMuted(muted) {
     this._muted = Boolean(muted);
     this.el.muteBtn.textContent = this._muted ? '🔇' : '🔊';
     this.el.muteBtn.classList.toggle('is-active', this._muted);
+    if (!this._fullscreenSupported && this.el.mobQuickBtn) {
+      this.el.mobQuickBtn.textContent = this._muted ? '🔇' : '🔊';
+      this.el.mobQuickBtn.classList.toggle('is-active', this._muted);
+    }
+    if (this.el.drawerMuteBtn) {
+      this.el.drawerMuteBtn.textContent = this._muted ? '🔇 已静音' : '🔊 音效已开';
+      this.el.drawerMuteBtn.classList.toggle('is-active', !this._muted);
+    }
   }
 
   toggleHelp(force) {
@@ -569,7 +1020,7 @@ export class HUD {
     this.el.toastStack.appendChild(toast);
 
     // Keep toast stack compact
-    while (this.el.toastStack.children.length > 4) {
+    while (this.el.toastStack.children.length > 3) {
       this.el.toastStack.firstElementChild?.remove();
     }
 
@@ -594,7 +1045,8 @@ export class HUD {
 
   showError(title, detail) {
     this.el.errorTitle.textContent = title || '运行异常';
-    this.el.errorDetail.textContent = typeof detail === 'string' ? detail : String(detail?.stack || detail?.message || detail);
+    this.el.errorDetail.textContent =
+      typeof detail === 'string' ? detail : String(detail?.stack || detail?.message || detail);
     this.el.errorOverlay.classList.add('is-visible');
   }
 
@@ -614,8 +1066,9 @@ export class HUD {
     const px = playerState.position?.x ?? 0;
     const pz = playerState.position?.z ?? 0;
 
-    // 2.6px per degree gives ~155 deg visible arc in 410px compass bar
-    const pxPerDeg = 2.6;
+    // Responsive pixels-per-degree so compact mobile compass stays balanced
+    const isNarrow = window.innerWidth <= 560;
+    const pxPerDeg = isNarrow ? 1.55 : window.innerWidth <= 960 ? 2.0 : 2.6;
 
     for (const mark of this._compassMarks) {
       const diff = wrapAngleDeg(mark.deg - headingDeg);
@@ -660,8 +1113,8 @@ export class HUD {
     }
 
     const biomeObj = playerState.biome;
-    const biomeName = typeof biomeObj === 'string' ? biomeObj : (biomeObj?.name || '海中喜马拉雅');
-    const biomeId = typeof biomeObj === 'string' ? biomeObj : (biomeObj?.id || biomeName);
+    const biomeName = typeof biomeObj === 'string' ? biomeObj : biomeObj?.name || '海中喜马拉雅';
+    const biomeId = typeof biomeObj === 'string' ? biomeObj : biomeObj?.id || biomeName;
 
     if (biomeName !== this._lastBiomeName) {
       this._lastBiomeName = biomeName;
@@ -734,7 +1187,11 @@ export class HUD {
       const fps = Math.round(stats.fps || 60);
       const props = stats.props ?? 0;
       const joints = stats.joints ?? 0;
-      this.el.statsPill.textContent = `${fps} FPS · ${props} 物体 · ${joints} 粘合`;
+      const statsText = `${fps} FPS · ${props} 物体 · ${joints} 粘合`;
+      this.el.statsPill.textContent = statsText;
+      if (this.el.drawerStats) {
+        this.el.drawerStats.textContent = statsText;
+      }
     }
   }
 
@@ -744,8 +1201,9 @@ export class HUD {
     const canWeld = Boolean(u?.canWeld);
     const weldTargetName = u?.weldTargetName || '';
     const hasJoints = Boolean(u?.hasJoints);
+    const isTouch = this._touchActive || document.body.classList.contains('oh-touch-mode');
 
-    const promptKey = `${aimedName}|${heldName}|${canWeld}|${weldTargetName}|${hasJoints}`;
+    const promptKey = `${aimedName}|${heldName}|${canWeld}|${weldTargetName}|${hasJoints}|${isTouch}`;
     if (promptKey === this._lastPromptKey) return;
     this._lastPromptKey = promptKey;
 
@@ -758,29 +1216,39 @@ export class HUD {
 
     if (isHolding) {
       const parts = [];
-      if (canWeld && weldTargetName) {
-        parts.push(`<span class="oh-prompt-item is-gold"><kbd class="oh-kbd">G</kbd> 粘合到 <strong>${weldTargetName}</strong></span>`);
+      if (isTouch) {
+        if (canWeld && weldTargetName) {
+          parts.push(`<span class="oh-prompt-item is-gold">✨ 可粘合到 <strong>${weldTargetName}</strong></span>`);
+        } else {
+          parts.push(`<span class="oh-prompt-item">✋ 抓取中：<strong>${heldName}</strong></span>`);
+        }
       } else {
-        parts.push(`<span class="oh-prompt-item"><kbd class="oh-kbd">E</kbd> 放下 <strong>${heldName}</strong></span>`);
-      }
-      parts.push(`<span class="oh-prompt-item"><kbd class="oh-kbd">Q/R</kbd> 旋转</span>`);
-      parts.push(`<span class="oh-prompt-item"><kbd class="oh-kbd">左键</kbd> 投掷</span>`);
-      parts.push(`<span class="oh-prompt-item"><kbd class="oh-kbd">滚轮</kbd> 距离</span>`);
-      if (hasJoints) {
-        parts.push(`<span class="oh-prompt-item"><kbd class="oh-kbd">X</kbd> 拆开</span>`);
-      }
-      if (canWeld && weldTargetName) {
-        parts.push(`<span class="oh-prompt-item"><kbd class="oh-kbd">E</kbd> 放下</span>`);
+        if (canWeld && weldTargetName) {
+          parts.push(
+            `<span class="oh-prompt-item is-gold"><kbd class="oh-kbd">G</kbd> 粘合到 <strong>${weldTargetName}</strong></span>`
+          );
+        } else {
+          parts.push(`<span class="oh-prompt-item"><kbd class="oh-kbd">E</kbd> 放下 <strong>${heldName}</strong></span>`);
+        }
+        parts.push(`<span class="oh-prompt-item"><kbd class="oh-kbd">Q/R</kbd> 旋转</span>`);
+        parts.push(`<span class="oh-prompt-item"><kbd class="oh-kbd">左键</kbd> 投掷</span>`);
+        parts.push(`<span class="oh-prompt-item"><kbd class="oh-kbd">滚轮</kbd> 距离</span>`);
+        if (hasJoints) {
+          parts.push(`<span class="oh-prompt-item"><kbd class="oh-kbd">X</kbd> 拆开</span>`);
+        }
+        if (canWeld && weldTargetName) {
+          parts.push(`<span class="oh-prompt-item"><kbd class="oh-kbd">E</kbd> 放下</span>`);
+        }
       }
 
       this.el.contextPrompt.innerHTML = parts.join('');
       this.el.contextPrompt.classList.add('is-visible');
       this.el.contextPrompt.classList.toggle('is-weld', canWeld);
     } else if (isAiming) {
-      const parts = [
-        `<span class="oh-prompt-item"><kbd class="oh-kbd">E</kbd> 抓取 <strong>${aimedName}</strong></span>`,
-      ];
-      if (hasJoints) {
+      const parts = isTouch
+        ? [`<span class="oh-prompt-item">✋ 点「抓取」拾取 <strong>${aimedName}</strong></span>`]
+        : [`<span class="oh-prompt-item"><kbd class="oh-kbd">E</kbd> 抓取 <strong>${aimedName}</strong></span>`];
+      if (!isTouch && hasJoints) {
         parts.push(`<span class="oh-prompt-item"><kbd class="oh-kbd">X</kbd> 拆开粘合</span>`);
       }
       this.el.contextPrompt.innerHTML = parts.join('');

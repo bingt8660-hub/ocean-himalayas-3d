@@ -12,6 +12,9 @@ const WORLD_UP = new THREE.Vector3(0, 1, 0);
 const BEAM_AXIS = new THREE.Vector3(0, 1, 0);
 
 const MAX_AIM_DIST = 16.0;
+const SOFT_CONE_SEARCH_DIST = 15.0;
+const SOFT_CONE_MAX_DIST = 14.0;
+const SOFT_CONE_MIN_DOT = 0.981; // ~11.18° half-angle
 const SNAP_DIST = 4.2;
 const MIN_HOLD_DIST = 3.0;
 const MAX_HOLD_DIST = 12.0;
@@ -160,9 +163,22 @@ export class UltrahandSystem {
     }
   }
 
+  _setHeldProp(prop) {
+    if (this.heldProp && this.heldProp !== prop) {
+      this.heldProp._isHeld = false;
+    }
+    this.heldProp = prop || null;
+    if (this.heldProp) {
+      this.heldProp._isHeld = true;
+    }
+    if (this.physics && typeof this.physics.setHeldProp === 'function') {
+      this.physics.setHeldProp(this.heldProp);
+    }
+  }
+
   /**
-   * Per-frame update: raycast target, PD-drive held body with real collisions,
-   * detect weld snap candidates, and update energy beam / outline / snap visuals.
+   * Per-frame update: hybrid raycast + soft-cone target search, PD-drive held body
+   * with real collisions, detect weld snap candidates, and update energy beam / outline / snap visuals.
    */
   update(dt, playerHandPos, camera = this.camera) {
     if (camera) this.camera = camera;
@@ -171,7 +187,7 @@ export class UltrahandSystem {
 
     // Release gracefully if held prop was destroyed (e.g. barrel detonated)
     if (this.heldProp && this.heldProp._destroyed) {
-      this.heldProp = null;
+      this._setHeldProp(null);
       this.snapCandidate = null;
     }
 
@@ -191,6 +207,8 @@ export class UltrahandSystem {
     this.aimedProp = null;
     if (!this.camera || !this.physics || this.physics.props.length === 0) return;
 
+    // 1. Exact center raycast first so precise aim always wins
+    this.camera.updateMatrixWorld();
     this.raycaster.setFromCamera(CENTER_NDC, this.camera);
     const meshes = [];
     for (let i = 0; i < this.physics.props.length; i++) {
@@ -212,6 +230,43 @@ export class UltrahandSystem {
         }
       }
     }
+
+    // 2. Fallback: mobile-friendly soft-cone aim assist (~11° cone within 14m)
+    this.camera.getWorldDirection(_camForward).normalize();
+    const camPos = this.camera.position;
+    const maxSearchDistSq = SOFT_CONE_SEARCH_DIST * SOFT_CONE_SEARCH_DIST;
+
+    let bestProp = null;
+    let bestScore = Infinity;
+
+    for (let i = 0; i < this.physics.props.length; i++) {
+      const p = this.physics.props[i];
+      if (p._destroyed || !p.body) continue;
+
+      const pt = p.body.translation();
+      const dx = pt.x - camPos.x;
+      const dy = pt.y - camPos.y;
+      const dz = pt.z - camPos.z;
+      const distSq = dx * dx + dy * dy + dz * dz;
+      if (distSq > maxSearchDistSq || distSq < 0.04) continue;
+
+      const dist = Math.sqrt(distSq);
+      if (dist > SOFT_CONE_MAX_DIST) continue;
+
+      const dot =
+        (dx * _camForward.x + dy * _camForward.y + dz * _camForward.z) / dist;
+      if (dot <= SOFT_CONE_MIN_DOT) continue;
+
+      // Smallest angular offset wins, with a gentle preference for closer props
+      const angle = Math.acos(clamp(dot, -1, 1));
+      const score = angle + (dist / SOFT_CONE_MAX_DIST) * 0.035;
+      if (score < bestScore) {
+        bestScore = score;
+        bestProp = p;
+      }
+    }
+
+    this.aimedProp = bestProp;
   }
 
   _driveHeldProp(dt) {
@@ -439,13 +494,13 @@ export class UltrahandSystem {
         },
         true
       );
-      this.heldProp = null;
+      this._setHeldProp(null);
       this.snapCandidate = null;
       return false;
     }
 
     if (this.aimedProp && !this.aimedProp._destroyed) {
-      this.heldProp = this.aimedProp;
+      this._setHeldProp(this.aimedProp);
       const t = this.heldProp.body.translation();
       const r = this.heldProp.body.rotation();
       const origin = this.camera ? this.camera.position : playerHandPos;
@@ -473,7 +528,7 @@ export class UltrahandSystem {
     if (!this.heldProp || this.heldProp._destroyed) return false;
 
     const prop = this.heldProp;
-    this.heldProp = null;
+    this._setHeldProp(null);
     this.snapCandidate = null;
 
     this.camera.getWorldDirection(_camForward).normalize();
@@ -521,6 +576,34 @@ export class UltrahandSystem {
     return true;
   }
 
+  /**
+   * Level the currently held prop cleanly to horizontal (zero pitch & roll)
+   * while preserving its current yaw snapped to the nearest 45-degree increment.
+   */
+  levelHeld() {
+    if (!this.heldProp || this.heldProp._destroyed) return false;
+
+    // Extract current yaw robustly even if pitched near ±90° (gimbal lock)
+    _v1.set(0, 0, 1).applyQuaternion(this.targetQuat);
+    let yaw = 0;
+    if (_v1.x * _v1.x + _v1.z * _v1.z > 1e-4) {
+      yaw = Math.atan2(_v1.x, _v1.z);
+    } else {
+      _v2.set(1, 0, 0).applyQuaternion(this.targetQuat);
+      yaw = Math.atan2(-_v2.z, _v2.x);
+    }
+
+    const step = Math.PI / 4;
+    const snappedYaw = Math.round(yaw / step) * step || 0;
+    this.targetQuat.setFromAxisAngle(WORLD_UP, snappedYaw).normalize();
+
+    const assembly = this.physics.getConnectedAssembly(this.heldProp);
+    for (let i = 0; i < assembly.length; i++) {
+      assembly[i].body.wakeUp();
+    }
+    return true;
+  }
+
   /** Push or pull the held prop smoothly within [3.0, 12.0] meters */
   adjustDistance(delta) {
     this.holdDistance = clamp(
@@ -541,7 +624,7 @@ export class UltrahandSystem {
       // Zero residual hand-carry drift and release smoothly so the contraption settles cleanly
       this.heldProp.body.setLinvel({ x: 0, y: 0, z: 0 }, true);
       this.heldProp.body.setAngvel({ x: 0, y: 0, z: 0 }, true);
-      this.heldProp = null;
+      this._setHeldProp(null);
       this.snapCandidate = null;
     }
     return joint;

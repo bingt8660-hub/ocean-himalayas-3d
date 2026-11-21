@@ -51,12 +51,36 @@ export class PhysicsEngine {
     this._accumulator = 0;
     this._elapsed = 0;
 
+    this._heldProp = null;
+    this._spawningStarters = false;
+    this._spawningPreset = false;
+    this.maxProps = this._detectMobile() ? 75 : 110;
+
     // Shared particle & glue resources initialized in init()
     this._particleGeo = null;
     this._glueGeo = null;
     this._glueCoreGeo = null;
     this._glueMat = null;
     this._glueCoreMat = null;
+  }
+
+  _detectMobile() {
+    if (typeof window === 'undefined' || typeof navigator === 'undefined') {
+      return false;
+    }
+    const coarse =
+      typeof window.matchMedia === 'function' &&
+      window.matchMedia('(pointer: coarse)').matches;
+    const touch =
+      (navigator.maxTouchPoints || 0) > 0 || 'ontouchstart' in window;
+    const smallScreen =
+      Math.min(window.innerWidth || 9999, window.innerHeight || 9999) <= 900;
+    return Boolean(coarse || (touch && smallScreen));
+  }
+
+  /** Track currently Ultrahand-held prop so prop-cap pruning never despawns it */
+  setHeldProp(prop) {
+    this._heldProp = prop && !prop._destroyed ? prop : null;
   }
 
   /**
@@ -171,6 +195,10 @@ export class PhysicsEngine {
       return null;
     }
 
+    if (!this._spawningStarters && !this._spawningPreset) {
+      this._enforcePropCap(1);
+    }
+
     const id = this._nextPropId++;
     const pos = {
       x: position.x ?? 0,
@@ -236,6 +264,8 @@ export class PhysicsEngine {
       halfExtentY: this._estimateHalfExtent(def),
       _lastImpactTime: -10,
       _lastParticleTime: 0,
+      _isStarter: Boolean(this._spawningStarters),
+      _isHeld: false,
       _destroyed: false,
     };
 
@@ -801,21 +831,26 @@ export class PhysicsEngine {
    * Populate the Ocean Himalayas with immediately playable contraptions & sandbox parts.
    */
   spawnStarterContraptions() {
-    // 1. Beach Wooden Raft floating gently in the shallow coral bay right by beach_raft
-    // Water depth at (-5, 146) is ~ -1.35m, just a few steps off the sandy shore
-    this._spawnBeachRaft(-5, 146);
+    this._spawningStarters = true;
+    try {
+      // 1. Beach Wooden Raft floating gently in the shallow coral bay right by beach_raft
+      // Water depth at (-5, 146) is ~ -1.35m, just a few steps off the sandy shore
+      this._spawnBeachRaft(-5, 146);
 
-    // 2. Coastal Starter Buggy near bay_camp (-42, 186)
-    this._spawnCoastalBuggy(-42, 186);
+      // 2. Coastal Starter Buggy near bay_camp (-42, 186)
+      this._spawnCoastalBuggy(-42, 186);
 
-    // 3. Cliffside Boulders & Barrels at waterfall_cliff (92, 88) and main_summit (16, -100)
-    this._spawnCliffsideHazards();
+      // 3. Cliffside Boulders & Barrels at waterfall_cliff (92, 88) and main_summit (16, -100)
+      this._spawnCliffsideHazards();
 
-    // 4. Alpine Rocket Sled near alpine_ruins (14, 10)
-    this._spawnAlpineRocketSled(14, 10);
+      // 4. Alpine Rocket Sled near alpine_ruins (14, 10)
+      this._spawnAlpineRocketSled(14, 10);
 
-    // 5. Spare Parts Pile near bay_camp (-58, 192) ready for Ultrahand building
-    this._spawnSparePartsPile(-58, 192);
+      // 5. Spare Parts Pile near bay_camp (-58, 192) ready for Ultrahand building
+      this._spawnSparePartsPile(-58, 192);
+    } finally {
+      this._spawningStarters = false;
+    }
   }
 
   _spawnBeachRaft(cx, cz) {
@@ -1100,7 +1135,7 @@ export class PhysicsEngine {
   }
 
   /** Remove all welded joints attached to `prop` */
-  unweldProp(prop) {
+  unweldProp(prop, silent = false) {
     if (!prop) return 0;
 
     let removed = 0;
@@ -1127,7 +1162,7 @@ export class PhysicsEngine {
     }
 
     this.joints = remaining;
-    if (removed > 0) {
+    if (removed > 0 && !silent) {
       this.emitSound('unweld', 0.9, new THREE.Vector3(pos.x, pos.y, pos.z));
     }
     return removed;
@@ -1841,5 +1876,368 @@ export class PhysicsEngine {
     }
 
     return this.spawnProp(typeId, { x, y, z }, quat);
+  }
+
+  /** Cleanly despawn a prop, removing its joints, physics body, and Three.js resources */
+  _despawnProp(prop) {
+    if (!prop || prop._destroyed) return false;
+    prop._destroyed = true;
+
+    if (this._heldProp === prop) {
+      this._heldProp = null;
+    }
+
+    // Drop any queued detonation for this prop
+    for (let i = this._pendingDetonations.length - 1; i >= 0; i--) {
+      if (this._pendingDetonations[i].prop === prop) {
+        this._pendingDetonations.splice(i, 1);
+      }
+    }
+
+    this.unweldProp(prop, true);
+
+    if (prop.mesh) {
+      if (this.scene) {
+        this.scene.remove(prop.mesh);
+      }
+      const disposedGeos = new Set();
+      const disposedMats = new Set();
+      prop.mesh.traverse((obj) => {
+        if (obj.geometry && !disposedGeos.has(obj.geometry)) {
+          disposedGeos.add(obj.geometry);
+          obj.geometry.dispose();
+        }
+        if (obj.material) {
+          const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
+          for (let m = 0; m < mats.length; m++) {
+            const mat = mats[m];
+            if (mat && !disposedMats.has(mat)) {
+              disposedMats.add(mat);
+              mat.dispose();
+            }
+          }
+        }
+      });
+    }
+
+    this.propById.delete(prop.id);
+    if (prop.collider) this.propByCollider.delete(prop.collider.handle);
+    if (prop.body) this.propByBody.delete(prop.body.handle);
+
+    const idx = this.props.indexOf(prop);
+    if (idx !== -1) this.props.splice(idx, 1);
+
+    try {
+      if (prop.body && this.world) {
+        this.world.removeRigidBody(prop.body);
+      }
+    } catch (_) {
+      // Body already removed
+    }
+
+    return true;
+  }
+
+  /**
+   * Soft safety cap on total dynamic props (75 mobile / 110 desktop).
+   * Gracefully despawns oldest unheld, non-starter loose props first so mobile RAM
+   * and physics FPS stay smooth no matter how much the player spawns.
+   */
+  _enforcePropCap(incomingCount = 1) {
+    const cap = this.maxProps || 110;
+    while (this.props.length + incomingCount > cap) {
+      // Build set of props currently held (or welded to a held prop)
+      const heldSet = new Set();
+      if (this._heldProp && !this._heldProp._destroyed) {
+        const heldAssembly = this.getConnectedAssembly(this._heldProp);
+        for (let i = 0; i < heldAssembly.length; i++) {
+          heldSet.add(heldAssembly[i]);
+        }
+      }
+      for (let i = 0; i < this.props.length; i++) {
+        const p = this.props[i];
+        if (p._isHeld && !p._destroyed && !heldSet.has(p)) {
+          const assembly = this.getConnectedAssembly(p);
+          for (let j = 0; j < assembly.length; j++) {
+            heldSet.add(assembly[j]);
+          }
+        }
+      }
+
+      // Build set of welded props so loose props are always preferred for pruning
+      const weldedSet = new Set();
+      for (let i = 0; i < this.joints.length; i++) {
+        const j = this.joints[i];
+        if (j.propA) weldedSet.add(j.propA);
+        if (j.propB) weldedSet.add(j.propB);
+      }
+
+      // Pass 1: oldest unheld, non-starter loose prop
+      let candidate = null;
+      for (let i = 0; i < this.props.length; i++) {
+        const p = this.props[i];
+        if (p._destroyed || p._isStarter || heldSet.has(p) || weldedSet.has(p)) {
+          continue;
+        }
+        candidate = p;
+        break;
+      }
+
+      if (candidate) {
+        this._despawnProp(candidate);
+        continue;
+      }
+
+      // Pass 2 fallback: if no loose props remain (e.g. many preset contraptions spawned),
+      // gracefully recycle the oldest unheld, non-starter prop / contraption assembly
+      let fallback = null;
+      for (let i = 0; i < this.props.length; i++) {
+        const p = this.props[i];
+        if (p._destroyed || p._isStarter || heldSet.has(p)) {
+          continue;
+        }
+        fallback = p;
+        break;
+      }
+
+      if (!fallback) break;
+
+      const assembly = this.getConnectedAssembly(fallback);
+      const canDespawnWholeAssembly =
+        assembly.length > 1 &&
+        assembly.every((part) => !part._isStarter && !heldSet.has(part));
+
+      if (canDespawnWholeAssembly) {
+        for (let i = 0; i < assembly.length; i++) {
+          this._despawnProp(assembly[i]);
+        }
+      } else {
+        this._despawnProp(fallback);
+      }
+    }
+  }
+
+  /** Sample max terrain/island surface height over a contraption's footprint */
+  _getFootprintSurfaceHeight(cx, cz, refY, radius = 1.5) {
+    let maxH = this.getSurfaceHeightAt(cx, cz, refY);
+    const offsets = [
+      [radius, 0],
+      [-radius, 0],
+      [0, radius],
+      [0, -radius],
+    ];
+    for (let i = 0; i < offsets.length; i++) {
+      const h = this.getSurfaceHeightAt(cx + offsets[i][0], cz + offsets[i][1], refY);
+      if (h > maxH) maxH = h;
+    }
+    return maxH;
+  }
+
+  /**
+   * One-tap complete contraption preset spawner for mobile & quick-build play.
+   * Supported presetIds: 'raft' (涡轮木筏), 'buggy' (四轮越野车), 'rocket_sled' (冲天火箭板).
+   * Returns { presetId, count, rootProp } or null if unknown preset.
+   */
+  spawnPresetContraption(presetId, origin, forwardDir) {
+    if (!this.world) return null;
+
+    const PRESET_COUNTS = {
+      raft: 6,
+      buggy: 6,
+      rocket_sled: 3,
+    };
+    const expectedCount = PRESET_COUNTS[presetId];
+    if (!expectedCount) return null;
+
+    const origX = origin?.x ?? 0;
+    const origY = origin?.y ?? 2;
+    const origZ = origin?.z ?? 0;
+
+    // Project forwardDir onto horizontal XZ plane so contraptions spawn cleanly level
+    let fx = forwardDir?.x ?? 0;
+    let fz = forwardDir?.z ?? -1;
+    const horizLen = Math.hypot(fx, fz);
+    if (horizLen < 1e-5) {
+      fx = 0;
+      fz = -1;
+    } else {
+      fx /= horizLen;
+      fz /= horizLen;
+    }
+
+    // Yaw mapping local forward (-Z) -> (fx, 0, fz)
+    const yaw = Math.atan2(-fx, -fz);
+    const baseQuat = new THREE.Quaternion().setFromAxisAngle(WORLD_UP, yaw);
+
+    const dist = presetId === 'rocket_sled' ? 5.0 : 5.5;
+    const cx = origX + fx * dist;
+    const cz = origZ + fz * dist;
+    const refY = origY + 2.5;
+    const footprintY = this._getFootprintSurfaceHeight(
+      cx,
+      cz,
+      refY,
+      presetId === 'rocket_sled' ? 1.4 : 1.6
+    );
+    const floorY = Math.max(footprintY, WORLD_CONFIG.SEA_LEVEL);
+
+    const clearance =
+      presetId === 'buggy' ? 1.25 : 0.55;
+    const baseY = floorY + clearance;
+    const centerPos = new THREE.Vector3(cx, baseY, cz);
+
+    const spawnPart = (typeId, lx, ly, lz, localQuat = null) => {
+      const worldPos = new THREE.Vector3(lx, ly, lz)
+        .applyQuaternion(baseQuat)
+        .add(centerPos);
+      const worldQuat = localQuat
+        ? baseQuat.clone().multiply(localQuat).normalize()
+        : baseQuat.clone();
+      return this.spawnProp(typeId, worldPos, worldQuat);
+    };
+
+    // Enforce soft prop cap once up front so newly spawned parts are never pruned mid-build
+    this._enforcePropCap(expectedCount);
+    this._spawningPreset = true;
+
+    const spawned = [];
+    let rootProp = null;
+    const silent = true;
+
+    try {
+      if (presetId === 'raft') {
+        const logLocalQ = new THREE.Quaternion().setFromAxisAngle(
+          new THREE.Vector3(1, 0, 0),
+          Math.PI * 0.5
+        );
+        const logs = [];
+        for (const xOff of [-0.78, 0, 0.78]) {
+          const log = spawnPart('log', xOff, 0, 0, logLocalQ);
+          if (log) {
+            logs.push(log);
+            spawned.push(log);
+          }
+        }
+
+        const plankF = spawnPart('plank', 0, 0.44, -0.85);
+        const plankB = spawnPart('plank', 0, 0.44, 0.85);
+        if (plankF) spawned.push(plankF);
+        if (plankB) spawned.push(plankB);
+
+        // Stern fan facing forward (-Z) with slight upward planing trim
+        const fanLocalQ = new THREE.Quaternion().setFromAxisAngle(
+          new THREE.Vector3(1, 0, 0),
+          -Math.PI * 0.43
+        );
+        const fan = spawnPart('fan', 0, 0.92, 1.48, fanLocalQ);
+        if (fan) spawned.push(fan);
+
+        if (logs.length === 3) {
+          this.weldProps(logs[0], logs[1], silent);
+          this.weldProps(logs[1], logs[2], silent);
+          if (plankF) {
+            this.weldProps(plankF, logs[0], silent);
+            this.weldProps(plankF, logs[1], silent);
+            this.weldProps(plankF, logs[2], silent);
+          }
+          if (plankB) {
+            this.weldProps(plankB, logs[0], silent);
+            this.weldProps(plankB, logs[1], silent);
+            this.weldProps(plankB, logs[2], silent);
+          }
+        }
+        if (plankF && plankB) {
+          this.weldProps(plankF, plankB, silent);
+        }
+        if (fan && plankB) {
+          this.weldProps(fan, plankB, silent);
+        }
+
+        rootProp = logs[1] || plankF || spawned[0] || null;
+      } else if (presetId === 'buggy') {
+        const chassisLocalQ = new THREE.Quaternion().setFromAxisAngle(
+          WORLD_UP,
+          Math.PI * 0.5
+        );
+        const chassis = spawnPart('plank', 0, 0, 0, chassisLocalQ);
+        if (chassis) spawned.push(chassis);
+
+        // Axle +Y -> local +X so cross(WORLD_UP, +X) = local forward (-Z)
+        const wheelLocalQ = new THREE.Quaternion().setFromAxisAngle(
+          new THREE.Vector3(0, 0, 1),
+          -Math.PI * 0.5
+        );
+        const wheelOffsets = [
+          [-1.02, -0.22, -1.12],
+          [1.02, -0.22, -1.12],
+          [-1.02, -0.22, 1.12],
+          [1.02, -0.22, 1.12],
+        ];
+        const wheels = [];
+        for (let i = 0; i < wheelOffsets.length; i++) {
+          const [wx, wy, wz] = wheelOffsets[i];
+          const w = spawnPart('wheel', wx, wy, wz, wheelLocalQ);
+          if (w) {
+            wheels.push(w);
+            spawned.push(w);
+          }
+        }
+
+        // Rear booster fan thrusting cleanly forward (-Z)
+        const fanLocalQ = new THREE.Quaternion().setFromAxisAngle(
+          new THREE.Vector3(1, 0, 0),
+          -Math.PI * 0.5
+        );
+        const fan = spawnPart('fan', 0, 0.68, 1.48, fanLocalQ);
+        if (fan) spawned.push(fan);
+
+        if (chassis) {
+          for (let i = 0; i < wheels.length; i++) {
+            this.weldProps(chassis, wheels[i], silent);
+          }
+          if (fan) {
+            this.weldProps(chassis, fan, silent);
+          }
+        }
+
+        rootProp = chassis || spawned[0] || null;
+      } else if (presetId === 'rocket_sled') {
+        const sledLocalQ = new THREE.Quaternion().setFromAxisAngle(
+          WORLD_UP,
+          Math.PI * 0.5
+        );
+        const plank = spawnPart('plank', 0, 0, 0, sledLocalQ);
+        if (plank) {
+          spawned.push(plank);
+        }
+
+        // Two Zonai rockets angled forward (-Z) and ~34° upward for dramatic launch
+        const rocketLocalQ = new THREE.Quaternion().setFromAxisAngle(
+          new THREE.Vector3(1, 0, 0),
+          -Math.PI * 0.31
+        );
+        const rLeft = spawnPart('rocket', -0.85, 0.36, 0.05, rocketLocalQ);
+        const rRight = spawnPart('rocket', 0.85, 0.36, 0.05, rocketLocalQ);
+        if (rLeft) spawned.push(rLeft);
+        if (rRight) spawned.push(rRight);
+
+        if (plank && rLeft) this.weldProps(plank, rLeft, silent);
+        if (plank && rRight) this.weldProps(plank, rRight, silent);
+
+        rootProp = plank || spawned[0] || null;
+      }
+    } finally {
+      this._spawningPreset = false;
+    }
+
+    for (let i = 0; i < spawned.length; i++) {
+      spawned[i].body.wakeUp();
+    }
+
+    return {
+      presetId,
+      count: spawned.length,
+      rootProp,
+    };
   }
 }

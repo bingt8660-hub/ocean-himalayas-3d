@@ -169,6 +169,7 @@ export class HeroineCharacter {
 
     this.vrm = null;
     this._loadToken = 0;
+    this._shadowsEnabled = true;
     this._restHipsY = 0.85;
     this._boneCache = new Map();
     this._smoothedRot = new Map();
@@ -574,16 +575,34 @@ export class HeroineCharacter {
 
   /**
    * Loads a VRM 0.x or VRM 1.0 model asynchronously, normalizes orientation (+Z forward),
-   * scales cleanly to ~1.62m with feet at y = 0, and enables shadows + disables skinned culling.
+   * scales cleanly to ~1.62m with feet at y = 0, reports download progress via onProgress,
+   * and keeps skinned meshes crisp across quality & shadowMap toggles.
+   *
+   * @param {string} url
+   * @param {((percent: number | null) => void) | null} [onProgress=null]
    */
-  async loadModel(url) {
+  async loadModel(url, onProgress = null) {
     const token = ++this._loadToken;
     const loader = new GLTFLoader();
     loader.register((parser) => new VRMLoaderPlugin(parser));
 
+    const handleProgress =
+      typeof onProgress === 'function'
+        ? (xhr) => {
+            if (token !== this._loadToken) return;
+            if (xhr && xhr.total > 0) {
+              onProgress(Math.min(100, Math.round((xhr.loaded / xhr.total) * 100)));
+            } else {
+              onProgress(null);
+            }
+          }
+        : undefined;
+
     let gltf;
     try {
-      gltf = await loader.loadAsync(url);
+      gltf = await new Promise((resolve, reject) => {
+        loader.load(url, resolve, handleProgress, reject);
+      });
     } catch (err) {
       console.warn(`[HeroineCharacter] Failed to load VRM from "${url}":`, err);
       if (token === this._loadToken && !this.vrm) {
@@ -644,12 +663,51 @@ export class HeroineCharacter {
     }
     vrm.scene.updateMatrixWorld(true);
 
-    // Configure shadows & disable frustum culling on skinned meshes so limbs never vanish
+    // Configure shadows, crisp texture filtering, disable frustum culling on skinned meshes,
+    // and keep MToon/Standard materials crisp whenever renderer.shadowMap.enabled toggles on 'low' quality
     vrm.scene.traverse((obj) => {
-      if (obj.isMesh) {
-        obj.castShadow = true;
-        obj.receiveShadow = true;
-        obj.frustumCulled = false;
+      if (!obj.isMesh) return;
+
+      const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
+      const isOutlineOnly = mats.length > 0 && mats.every((m) => m && m._isOutline);
+
+      obj.castShadow = this._shadowsEnabled && !isOutlineOnly;
+      obj.receiveShadow = this._shadowsEnabled && !isOutlineOnly;
+      obj.frustumCulled = false;
+
+      for (const mat of mats) {
+        if (!mat) continue;
+        // Keep anime face, eye & outfit textures crisp at oblique mobile camera angles
+        const textures = [
+          mat.map,
+          mat.shadeMultiplyTexture,
+          mat.emissiveMap,
+          mat.normalMap,
+          mat.matcapTexture,
+        ];
+        for (const tex of textures) {
+          if (tex && tex.isTexture) {
+            tex.anisotropy = Math.max(tex.anisotropy || 1, 4);
+          }
+        }
+        mat.needsUpdate = true;
+      }
+
+      if (!isOutlineOnly) {
+        const prevOnBeforeRender = obj.onBeforeRender;
+        obj.onBeforeRender = (renderer, scene, camera, geometry, material, group) => {
+          if (material && !material.isMeshDepthMaterial && !material.isMeshDistanceMaterial) {
+            const shadowOn = Boolean(renderer?.shadowMap?.enabled) && this._shadowsEnabled;
+            if (material.userData._vrmShadowEnabled !== shadowOn) {
+              material.userData._vrmShadowEnabled = shadowOn;
+              obj.receiveShadow = shadowOn;
+              material.needsUpdate = true;
+            }
+          }
+          if (typeof prevOnBeforeRender === 'function') {
+            prevOnBeforeRender.call(obj, renderer, scene, camera, geometry, material, group);
+          }
+        };
       }
     });
 
@@ -690,6 +748,29 @@ export class HeroineCharacter {
     this.vrm.update(0.016);
 
     return vrm;
+  }
+
+  /**
+   * Synchronizes character shadow casting/receiving and forces clean shader refresh
+   * when toggling shadow mapping off on low-end mobile presets.
+   */
+  setShadowsEnabled(enabled) {
+    this._shadowsEnabled = Boolean(enabled);
+    const roots = [this.vrm?.scene, this.fallbackGroup, this.paragliderGroup].filter(Boolean);
+    for (const root of roots) {
+      root.traverse((obj) => {
+        if (!obj.isMesh) return;
+        const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
+        const isOutlineOnly = mats.length > 0 && mats.every((m) => m && m._isOutline);
+        obj.castShadow = this._shadowsEnabled && !isOutlineOnly;
+        obj.receiveShadow = this._shadowsEnabled && !isOutlineOnly;
+        for (const mat of mats) {
+          if (!mat) continue;
+          mat.userData._vrmShadowEnabled = this._shadowsEnabled;
+          mat.needsUpdate = true;
+        }
+      });
+    }
   }
 
   /**

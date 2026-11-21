@@ -1,7 +1,7 @@
 /**
  * Main Entry & Integrator for "海中喜马拉雅" (Ocean Himalayas 3D).
  * Coordinates Three.js renderer, OceanHimalayasWorld, Rapier3D PhysicsEngine,
- * UltrahandSystem, VRM HeroineCharacter, PlayerController, SoundEngine, and HUD.
+ * UltrahandSystem, VRM HeroineCharacter, PlayerController, SoundEngine, TouchControls, and HUD.
  */
 
 import * as THREE from 'three';
@@ -24,6 +24,18 @@ for (const prop of Object.values(PROP_CATALOG)) {
   PROP_BY_KEY.set(`Digit${prop.key}`, prop);
 }
 
+const QUALITY_LABELS = {
+  low: '流畅 (省电)',
+  medium: '均衡 (推荐)',
+  high: '极致',
+};
+
+const PRESET_LABELS = {
+  raft: '🛶 涡轮木筏',
+  buggy: '🏎️ 越野车',
+  rocket_sled: '🚀 火箭板',
+};
+
 async function boot() {
   const container = document.getElementById('app') || document.body;
 
@@ -37,12 +49,18 @@ async function boot() {
   let ultrahand = null;
   let touchControls = null;
   let renderer = null;
+  let camera = null;
   let modelLoadToken = 0;
+  let isContextLost = false;
+
   const isMobile = isTouchDevice();
+  let currentQuality = isMobile ? 'medium' : 'high';
+  let currentMaxDpr = isMobile ? 1.35 : 2.0;
 
   // Reusable scratch vectors (zero per-frame allocations)
   const handPos = new THREE.Vector3();
   const camForward = new THREE.Vector3();
+  const flatForward = new THREE.Vector3();
   const spawnOrigin = new THREE.Vector3();
   const activatePos = new THREE.Vector3();
 
@@ -55,6 +73,78 @@ async function boot() {
       }
     } else if (eventOrType && typeof eventOrType === 'object') {
       sound.play(eventOrType.type || eventOrType.event, eventOrType);
+    }
+  };
+
+  const getViewportSize = () => {
+    const vv = window.visualViewport;
+    const width = Math.max(1, Math.round(vv?.width || window.innerWidth || 1));
+    const height = Math.max(1, Math.round(vv?.height || window.innerHeight || 1));
+    return { width, height };
+  };
+
+  const handleResize = () => {
+    if (!renderer || !camera) return;
+    const { width, height } = getViewportSize();
+    camera.aspect = width / height;
+    camera.updateProjectionMatrix();
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, currentMaxDpr));
+    renderer.setSize(width, height);
+  };
+
+  const applyQualityPreset = (preset, silent = false) => {
+    const next = preset === 'low' || preset === 'medium' || preset === 'high' ? preset : 'medium';
+    currentQuality = next;
+
+    let shadowsEnabled = true;
+    if (next === 'low') {
+      currentMaxDpr = 1.0;
+      shadowsEnabled = false;
+    } else if (next === 'medium') {
+      currentMaxDpr = isMobile ? 1.35 : 1.5;
+      shadowsEnabled = true;
+    } else {
+      currentMaxDpr = isMobile ? 1.75 : 2.0;
+      shadowsEnabled = true;
+    }
+
+    if (renderer) {
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, currentMaxDpr));
+      renderer.shadowMap.enabled = shadowsEnabled;
+      renderer.shadowMap.needsUpdate = true;
+    }
+
+    world?.setQualityPreset?.(next);
+    hud.setQualityPreset?.(next);
+
+    if (!silent) {
+      hud.showToast(`画质切换：${QUALITY_LABELS[next] || next}`, 'info', 1600);
+    }
+  };
+
+  const isDocumentFullscreen = () =>
+    Boolean(document.fullscreenElement || document.webkitFullscreenElement);
+
+  const toggleFullscreen = async () => {
+    const docEl = document.documentElement;
+    try {
+      if (isDocumentFullscreen()) {
+        if (document.exitFullscreen) {
+          await document.exitFullscreen();
+        } else if (document.webkitExitFullscreen) {
+          document.webkitExitFullscreen();
+        }
+      } else if (docEl.requestFullscreen) {
+        await docEl.requestFullscreen({ navigationUI: 'hide' }).catch(() => docEl.requestFullscreen());
+      } else if (docEl.webkitRequestFullscreen) {
+        docEl.webkitRequestFullscreen();
+      } else {
+        hud.showToast('当前浏览器不支持全屏，可添加到主屏幕体验全屏', 'warn', 2600);
+        return;
+      }
+      setTimeout(handleResize, 120);
+    } catch {
+      hud.showToast('浏览器限制了全屏切换', 'warn', 2000);
     }
   };
 
@@ -78,6 +168,27 @@ async function boot() {
     hud.showToast(`已召唤：${prop.name}`, 'info', 1500);
   };
 
+  const spawnPresetContraption = (presetId) => {
+    if (!physics || !player) return;
+    const state = player.getState();
+    const pos = state?.position;
+    if (!pos) return;
+
+    player.getCameraForward(camForward);
+    flatForward.set(camForward.x, 0, camForward.z);
+    if (flatForward.lengthSq() < 1e-4) flatForward.set(0, 0, -1);
+    flatForward.normalize();
+
+    spawnOrigin.set(pos.x, pos.y + 1.25, pos.z);
+    if (typeof physics.spawnPresetContraption === 'function') {
+      physics.spawnPresetContraption(presetId, spawnOrigin, flatForward);
+      sound.play('spawn');
+      hud.showToast(`已召唤整车：${PRESET_LABELS[presetId] || presetId}`, 'success', 2000);
+    } else {
+      hud.showToast('当前版本暂未启用整车预设', 'warn', 1800);
+    }
+  };
+
   const toggleNearbyContraptions = () => {
     if (!physics || !player) return;
     const state = player.getState();
@@ -97,26 +208,34 @@ async function boot() {
     if (!heroine || !model) return;
     const token = ++modelLoadToken;
     hud.setActiveCharacter(model.id);
+    hud.setModelLoading?.(null, `加载 ${model.name}`);
 
     const isHttpHosted = window.location.protocol.startsWith('http');
     const urls = isHttpHosted
       ? [model.url, model.cdnUrl].filter(Boolean)
       : [model.cdnUrl, model.url].filter(Boolean);
 
+    const onProgress = (pct) => {
+      if (token !== modelLoadToken) return;
+      hud.setModelLoading?.(pct, `加载 ${model.name}`);
+    };
+
     let lastErr = null;
     for (const candidateUrl of urls) {
       try {
-        await heroine.loadModel(candidateUrl);
+        await heroine.loadModel?.(candidateUrl, onProgress);
         if (token !== modelLoadToken) return;
-        hud.showToast(`角色已加载：${model.name}`, 'success', 2600);
+        hud.setModelLoading?.(100, `角色已就绪`);
+        hud.showToast(`角色已加载：${model.name}`, 'success', 2400);
         return;
       } catch (err) {
         lastErr = err;
       }
     }
     if (token !== modelLoadToken) return;
+    hud.setModelLoading?.(false);
     console.warn('[OceanHimalayas] VRM model load warning:', lastErr);
-    hud.showToast(`模型加载受限，使用备用角色形象`, 'warn', 2800);
+    hud.showToast('模型加载受限，使用备用角色形象', 'warn', 2800);
   };
 
   const hud = new HUD(container, {
@@ -140,6 +259,19 @@ async function boot() {
         world.setTimePreset(presetId);
         hud.showToast(`天色切换：${TIME_PRESETS[presetId].label}`, 'info', 1800);
       }
+    },
+    onQualityChange: (presetId) => {
+      sound.unlock();
+      document.activeElement?.blur?.();
+      applyQualityPreset(presetId);
+    },
+    onSensitivityChange: (mult) => {
+      player?.setTouchSensitivity?.(mult);
+    },
+    onToggleFullscreen: () => {
+      sound.unlock();
+      document.activeElement?.blur?.();
+      toggleFullscreen();
     },
     onTeleport: (landmarkId) => {
       sound.unlock();
@@ -190,17 +322,25 @@ async function boot() {
     },
   });
 
+  // Sync fullscreen icon state cleanly
+  const syncFullscreenUI = () => {
+    hud.setFullscreenState?.(isDocumentFullscreen());
+    setTimeout(handleResize, 80);
+  };
+  document.addEventListener('fullscreenchange', syncFullscreenUI);
+  document.addEventListener('webkitfullscreenchange', syncFullscreenUI);
+
   try {
     hud.setLoadingProgress(12, '正在创建 WebGL 渲染引擎...');
 
     // --- Three.js Renderer, Scene & Camera ---
-    const maxDpr = isMobile ? 1.5 : 2;
+    const initialSize = getViewportSize();
     renderer = new THREE.WebGLRenderer({
       antialias: !isMobile,
       powerPreference: 'high-performance',
     });
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, maxDpr));
-    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, currentMaxDpr));
+    renderer.setSize(initialSize.width, initialSize.height);
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 1.06;
     renderer.outputColorSpace = THREE.SRGBColorSpace;
@@ -208,24 +348,40 @@ async function boot() {
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     container.appendChild(renderer.domElement);
 
+    // Graceful WebGL context loss / restore handling for mobile tab switching
+    renderer.domElement.addEventListener('webglcontextlost', (e) => {
+      e.preventDefault();
+      isContextLost = true;
+      hud.showToast('3D 画面已暂挂，返回后自动恢复', 'warn', 4000);
+    });
+    renderer.domElement.addEventListener('webglcontextrestored', () => {
+      isContextLost = false;
+      handleResize();
+      applyQualityPreset(currentQuality, true);
+      hud.showToast('3D 画面已恢复', 'success', 2000);
+    });
+
     const scene = new THREE.Scene();
-    const camera = new THREE.PerspectiveCamera(
+    camera = new THREE.PerspectiveCamera(
       60,
-      window.innerWidth / window.innerHeight,
+      initialSize.width / initialSize.height,
       0.2,
       4500
     );
 
-    window.addEventListener('resize', () => {
-      camera.aspect = window.innerWidth / window.innerHeight;
-      camera.updateProjectionMatrix();
-      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, maxDpr));
-      renderer.setSize(window.innerWidth, window.innerHeight);
+    // Dynamic viewport resize + phone rotation listeners (iOS Safari & Android Chrome)
+    window.addEventListener('resize', handleResize);
+    window.visualViewport?.addEventListener('resize', handleResize);
+    window.addEventListener('orientationchange', () => {
+      handleResize();
+      setTimeout(handleResize, 120);
+      setTimeout(handleResize, 360);
     });
 
     // --- 1. World Generation (Ocean + Himalayas + Sky + Clouds + Waterfalls) ---
     hud.setLoadingProgress(30, '正在雕琢喜马拉雅雪山与珊瑚海湾...');
     world = new OceanHimalayasWorld(scene, renderer);
+    applyQualityPreset(currentQuality, true);
     world.setTimePreset('golden');
     hud.setActiveTimePreset('golden');
 
@@ -241,6 +397,7 @@ async function boot() {
     player = new PlayerController(physics, heroine, camera, renderer.domElement);
     player.onAudioEvent(handleAudioEvent);
     player.teleportTo(SPAWN_POINT);
+    hud.setSensitivity?.(player.touchSensitivityMult ?? 1.0);
 
     ultrahand = new UltrahandSystem(physics, scene, camera);
 
@@ -250,6 +407,7 @@ async function boot() {
     touchControls = new TouchControls(container, renderer.domElement, keys, {
       onInteract: () => sound.unlock(),
       onAutoEnable: () => hud.setTouchActive(true),
+      onCanvasTap: () => hud.closeMobileSheets?.(),
       onLookDelta: (dx, dy) => player.applyLookDelta(dx, dy),
       onPinchZoom: (delta) => {
         if (ultrahand.heldProp) {
@@ -275,6 +433,13 @@ async function boot() {
           hud.showToast('究极手粘合成功', 'success', 1600);
         }
       },
+      onLevelHeld: () => {
+        if (ultrahand?.heldProp) {
+          ultrahand?.levelHeld?.();
+          sound.play('grab');
+          hud.showToast('已水平摆正部件', 'info', 1200);
+        }
+      },
       onUnweld: () => {
         const beforeJoints = physics.getPropCount()?.joints ?? 0;
         const unwelded = ultrahand.tryUnweld();
@@ -294,8 +459,11 @@ async function boot() {
       onAdjustDistance: (delta) => ultrahand.adjustDistance(delta),
       onToggleActivate: () => toggleNearbyContraptions(),
       onSpawnProp: (propId) => spawnProp(propId),
+      onSpawnPreset: (presetId) => spawnPresetContraption(presetId),
     });
     hud.setTouchActive(touchControls.enabled);
+    hud.setMuted(sound.isMuted);
+    hud.setFullscreenState?.(isDocumentFullscreen());
 
     const setKeyState = (e, pressed) => {
       keys[e.code] = pressed;
@@ -460,6 +628,8 @@ async function boot() {
         const instFps = 1 / rawDt;
         smoothedFps = smoothedFps * 0.9 + Math.min(240, instFps) * 0.1;
       }
+
+      if (isContextLost) return;
 
       const isUltrahandActive = Boolean(ultrahand.heldProp);
 

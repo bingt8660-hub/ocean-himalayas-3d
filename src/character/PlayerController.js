@@ -123,6 +123,9 @@ export class PlayerController {
     this.currentCamDistance = 6.5;
     this.mouseSensitivity = 0.0024;
     this.dragSensitivity = 0.0042;
+    this.touchSensitivityMult = 1.0;
+    this._touchPendingYaw = 0;
+    this._touchPendingPitch = 0;
     this.isPointerLocked = false;
     this._isUltrahandActive = false;
 
@@ -274,11 +277,45 @@ export class PlayerController {
     this.domElement.addEventListener('contextmenu', this._onContextMenu);
   }
 
+  /** Sets mobile touch-look sensitivity multiplier (clamped [0.4, 2.2]) */
+  setTouchSensitivity(mult) {
+    const val = Number(mult);
+    if (!Number.isFinite(val)) return;
+    this.touchSensitivityMult = clamp(val, 0.4, 2.2);
+  }
+
   /** Smooth external camera rotation (used by mobile touch-look) */
   applyLookDelta(dx, dy) {
-    const sens = this.dragSensitivity * 1.15;
-    this.yaw -= clamp(dx, -140, 140) * sens;
-    this.pitch = clamp(this.pitch + clamp(dy, -140, 140) * sens, this.minPitch, this.maxPitch);
+    const sens = this.dragSensitivity * 1.15 * this.touchSensitivityMult;
+    const dYaw = -clamp(dx, -140, 140) * sens;
+    const dPitch = clamp(dy, -140, 140) * sens;
+    // Queue into frame-smoothed accumulators for buttery touch feel with crisp stop
+    this._touchPendingYaw = clamp(this._touchPendingYaw + dYaw, -1.6, 1.6);
+    this._touchPendingPitch = clamp(this._touchPendingPitch + dPitch, -0.9, 0.9);
+  }
+
+  /** Integrates queued touch-look deltas with crisp exponential damping */
+  _applyTouchLookSmoothing(dt) {
+    if (this._touchPendingYaw !== 0) {
+      const kYaw = 1 - Math.exp(-28 * dt);
+      const stepYaw = this._touchPendingYaw * kYaw;
+      this.yaw += stepYaw;
+      this._touchPendingYaw -= stepYaw;
+      if (Math.abs(this._touchPendingYaw) < 1e-5) {
+        this.yaw += this._touchPendingYaw;
+        this._touchPendingYaw = 0;
+      }
+    }
+    if (this._touchPendingPitch !== 0) {
+      const kPitch = 1 - Math.exp(-32 * dt);
+      const stepPitch = this._touchPendingPitch * kPitch;
+      this.pitch = clamp(this.pitch + stepPitch, this.minPitch, this.maxPitch);
+      this._touchPendingPitch -= stepPitch;
+      if (Math.abs(this._touchPendingPitch) < 1e-5) {
+        this.pitch = clamp(this.pitch + this._touchPendingPitch, this.minPitch, this.maxPitch);
+        this._touchPendingPitch = 0;
+      }
+    }
   }
 
   /** Smooth external camera zoom (used by mobile two-finger pinch) */
@@ -335,6 +372,8 @@ export class PlayerController {
     this._coyoteTimer = 0;
     this._jumpBufferTimer = 0;
     this._climbCooldown = 0;
+    this._touchPendingYaw = 0;
+    this._touchPendingPitch = 0;
     this.currentCamDistance = this.cameraDistance;
 
     if (landmark.lookAt) {
@@ -527,6 +566,7 @@ export class PlayerController {
     const safeDt = clamp(dt || 0.016, 0.001, 0.05);
     this._isUltrahandActive = Boolean(isUltrahandActive);
     if (this._climbCooldown > 0) this._climbCooldown -= safeDt;
+    this._applyTouchLookSmoothing(safeDt);
 
     // Read current Rapier rigidbody state
     const t = this.body.translation();
@@ -748,7 +788,7 @@ export class PlayerController {
       }
     } else if (this.mode === 'swim') {
       const wantsSprint = sprintDown && hasMoveInput && !this._exhausted && this.stamina > 2;
-      const swimSpeed = wantsSprint ? 8.2 : 5.2;
+      const swimSpeed = wantsSprint ? 8.2 : 5.2 * (0.35 + 0.65 * moveMag);
 
       if (wantsSprint) {
         this._drainStamina(16.0 * safeDt);
@@ -829,7 +869,8 @@ export class PlayerController {
       // Ground & Airborne Locomotion ('idle' | 'walk' | 'run' | 'jump' | 'fall')
       const wantsSprint =
         sprintDown && hasMoveInput && this.isGrounded && !this._exhausted && this.stamina > 2;
-      const moveSpeed = wantsSprint ? 13.5 : 7.5;
+      const analogWalkScale = 0.35 + 0.65 * moveMag;
+      const moveSpeed = wantsSprint ? 13.5 : 7.5 * analogWalkScale;
 
       if (wantsSprint) {
         this._drainStamina(18.0 * safeDt);
